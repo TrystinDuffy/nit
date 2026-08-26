@@ -152,6 +152,53 @@ impl GitRepository {
         Ok(commit)
     }
 
+    pub fn write_merged_vault_log(
+        &self,
+        vault: &str,
+        expected_local_commit: Option<&str>,
+        other_parent: &str,
+        log: &EventLog,
+        message: &str,
+    ) -> Result<String> {
+        validate_vault_name(vault)?;
+        validate_oid(other_parent)?;
+        if let Some(local) = expected_local_commit {
+            validate_oid(local)?;
+        }
+        let encoded = log.encode()?;
+        ensure!(
+            encoded.len() <= MAX_LOG_SIZE,
+            "vault event collection exceeds the size limit"
+        );
+        let blob = self.hash_object(&encoded)?;
+        let tree_input = format!("100644 blob {blob}\t{LOG_PATH}\n");
+        let tree = self.git_text_with_input(["mktree"], tree_input.as_bytes())?;
+        let mut arguments = vec!["commit-tree".to_owned(), tree.trim().to_owned()];
+        if let Some(local) = expected_local_commit {
+            arguments.push("-p".into());
+            arguments.push(local.into());
+        }
+        if expected_local_commit != Some(other_parent) {
+            arguments.push("-p".into());
+            arguments.push(other_parent.into());
+        }
+        arguments.push("-m".into());
+        arguments.push(message.into());
+        let commit = self.git_text(arguments)?.trim().to_owned();
+        validate_oid(&commit)?;
+
+        let reference = vault_ref(vault);
+        let old = expected_local_commit
+            .map(str::to_owned)
+            .unwrap_or_else(|| "0".repeat(commit.len()));
+        let output = self.git_output(["update-ref", &reference, &commit, &old], None)?;
+        ensure!(
+            output.status.success(),
+            "vault changed concurrently; fetch and merge again"
+        );
+        Ok(commit)
+    }
+
     pub fn read_local_checkpoint(&self, vault: &str) -> Result<Option<Hash>> {
         validate_vault_name(vault)?;
         let reference = local_ref(vault);
@@ -288,7 +335,7 @@ impl GitRepository {
         };
         let object = format!("{commit_oid}:{LOG_PATH}");
         let bytes = self.git_bytes(["show", &object])?;
-        let log = EventLog::decode(&bytes).context("cannot parse append-only vault log")?;
+        let log = EventLog::decode(&bytes).context("cannot parse vault event collection")?;
         Ok(Some(StoredLog { commit_oid, log }))
     }
 
@@ -484,9 +531,24 @@ mod tests {
             .unwrap();
         assert!(repository.read_onboarding_state("prod", &[8; 32]).is_err());
 
-        repository
+        let archive = repository
             .append_vault_log("archive", None, &log, "create another vault")
             .unwrap();
+        let merged = repository
+            .write_merged_vault_log(
+                "prod",
+                Some(&first),
+                &archive,
+                &log,
+                "merge event collections",
+            )
+            .unwrap();
+        for parent in [&first, &archive] {
+            let output = repository
+                .git_output(["merge-base", "--is-ancestor", parent, &merged], None)
+                .unwrap();
+            assert!(output.status.success());
+        }
         repository
             .write_onboarding_state("prod", &[9; 32], b"pending")
             .unwrap();

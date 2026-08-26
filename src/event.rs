@@ -11,9 +11,9 @@ pub type Hash = [u8; 32];
 pub type VaultId = [u8; 32];
 pub type EventId = [u8; 16];
 
-pub const LOG_MAGIC: &[u8; 8] = b"GVLOG002";
-pub const EVENT_MAGIC: &[u8; 8] = b"GVEVT002";
-pub const FORMAT_VERSION: u16 = 2;
+pub const LOG_MAGIC: &[u8; 8] = b"GVLOG003";
+pub const EVENT_MAGIC: &[u8; 8] = b"GVEVT003";
+pub const FORMAT_VERSION: u16 = 3;
 pub const MAX_EVENT_SIZE: usize = 20 * 1024 * 1024;
 pub const MAX_LOG_SIZE: usize = 64 * 1024 * 1024;
 pub const MAX_MEMBERS: usize = 64;
@@ -22,7 +22,6 @@ pub const MAX_PROPOSALS: usize = 128;
 pub const MAX_KEY_LEN: usize = 1_024;
 pub const MAX_VALUE_SIZE: usize = 16 * 1024 * 1024;
 pub const MAX_NAME_LEN: usize = 128;
-pub const MAX_CERTIFICATE_SIZE: usize = 16 * 1024;
 pub const MAX_PAKE_MESSAGE_SIZE: usize = 64 * 1024;
 
 const SIGNATURE_DOMAIN: &[u8] = b"git-vault/event-signature/v1";
@@ -57,7 +56,6 @@ pub struct MemberIdentity {
     pub name: String,
     pub signing_public_key: [u8; 32],
     pub encryption_public_key: [u8; 32],
-    pub certificate: Vec<u8>,
 }
 
 impl MemberIdentity {
@@ -107,41 +105,14 @@ pub enum ValueType {
     Bytes,
 }
 
-impl ValueType {
-    fn encode(self) -> u8 {
-        match self {
-            Self::Text => 1,
-            Self::Number => 2,
-            Self::Boolean => 3,
-            Self::Bytes => 4,
-        }
-    }
-
-    fn decode(value: u8) -> Result<Self> {
-        match value {
-            1 => Ok(Self::Text),
-            2 => Ok(Self::Number),
-            3 => Ok(Self::Boolean),
-            4 => Ok(Self::Bytes),
-            _ => bail!("unknown value type {value}"),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EventPayload {
     Genesis(MembershipEpoch),
     MembershipEpoch(MembershipEpoch),
-    Put {
+    Mutation {
         epoch_number: u64,
-        key: String,
-        value_type: ValueType,
         nonce: [u8; 12],
         ciphertext: Vec<u8>,
-    },
-    Delete {
-        epoch_number: u64,
-        key: String,
     },
     CreateInvitation {
         epoch_number: u64,
@@ -152,16 +123,9 @@ pub enum EventPayload {
     CloseInvitation {
         invitation_id: [u8; 16],
     },
-    InvitationResponse {
-        epoch_number: u64,
-        invitation_id: [u8; 16],
-        proposal_event_hash: Hash,
-        pake_message: Vec<u8>,
-    },
-    ProposeUser {
+    JoinProposal {
         invitation_id: [u8; 16],
         identity: MemberIdentity,
-        response_event_hash: Option<Hash>,
         pake_message: Vec<u8>,
     },
     Unknown {
@@ -175,18 +139,16 @@ impl EventPayload {
         match self {
             Self::Genesis(_) => 1,
             Self::MembershipEpoch(_) => 2,
-            Self::Put { .. } => 3,
-            Self::Delete { .. } => 4,
-            Self::CreateInvitation { .. } => 5,
-            Self::CloseInvitation { .. } => 6,
-            Self::ProposeUser { .. } => 7,
-            Self::InvitationResponse { .. } => 8,
+            Self::Mutation { .. } => 3,
+            Self::CreateInvitation { .. } => 4,
+            Self::CloseInvitation { .. } => 5,
+            Self::JoinProposal { .. } => 6,
             Self::Unknown { type_code, .. } => *type_code,
         }
     }
 
     pub fn is_trust_state_changing(&self) -> bool {
-        !matches!(self, Self::ProposeUser { .. } | Self::Unknown { .. })
+        !matches!(self, Self::JoinProposal { .. } | Self::Unknown { .. })
     }
 }
 
@@ -239,6 +201,10 @@ impl Event {
 
     pub fn event_hash(&self) -> Result<Hash> {
         self.verify_structure()?;
+        self.verified_event_hash()
+    }
+
+    pub(crate) fn verified_event_hash(&self) -> Result<Hash> {
         let mut hasher = Sha256::new();
         hasher.update(EVENT_HASH_DOMAIN);
         hasher.update(self.encode_without_signature()?);
@@ -326,32 +292,35 @@ impl Event {
 pub struct EventLog {
     pub events: Vec<Event>,
     pub diagnostics: Vec<String>,
-    raw_records: Vec<Vec<u8>>,
 }
 
 impl EventLog {
     pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut indexed = self
+            .events
+            .iter()
+            .map(|event| {
+                event.verify_structure()?;
+                Ok((event.verified_event_hash()?, event))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let root = indexed
+            .iter()
+            .position(|(_, event)| matches!(event.payload, EventPayload::Genesis(_)));
+        let root = root.map(|index| indexed.remove(index));
+        indexed.sort_by_key(|(hash, _)| *hash);
+
         let mut output = Vec::new();
         output.extend_from_slice(LOG_MAGIC);
-        if self.raw_records.is_empty() {
-            for event in &self.events {
-                let encoded = event.encode()?;
-                put_u32(&mut output, encoded.len())?;
-                output.extend_from_slice(&encoded);
-            }
-        } else {
-            for record in &self.raw_records {
-                ensure!(
-                    record.len() <= MAX_EVENT_SIZE,
-                    "event exceeds the size limit"
-                );
-                put_u32(&mut output, record.len())?;
-                output.extend_from_slice(record);
-            }
+        if let Some((_, event)) = root {
+            put_event_record(&mut output, event)?;
+        }
+        for (_, event) in indexed {
+            put_event_record(&mut output, event)?;
         }
         ensure!(
             output.len() <= MAX_LOG_SIZE,
-            "vault log exceeds the size limit"
+            "vault event collection exceeds the size limit"
         );
         Ok(output)
     }
@@ -359,13 +328,14 @@ impl EventLog {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         ensure!(
             bytes.len() <= MAX_LOG_SIZE,
-            "vault log exceeds the size limit"
+            "vault event collection exceeds the size limit"
         );
         let mut decoder = Decoder::new(bytes);
         ensure!(decoder.take(8)? == LOG_MAGIC, "invalid vault log magic");
         let mut events = Vec::new();
         let mut diagnostics = Vec::new();
-        let mut raw_records = Vec::new();
+        let mut hashes = BTreeSet::new();
+        let mut ids = BTreeSet::new();
         let mut record = 0usize;
         while !decoder.is_empty() {
             record += 1;
@@ -380,50 +350,111 @@ impl EventLog {
             let bytes = decoder
                 .take(length)
                 .with_context(|| format!("truncated event at record {record}"))?;
-            raw_records.push(bytes.to_vec());
             match Event::decode(bytes) {
-                Ok(event) => events.push(event),
+                Ok(event) => {
+                    let hash = event.verified_event_hash()?;
+                    if !hashes.insert(hash) {
+                        diagnostics.push(format!(
+                            "record {record}: duplicate event hash {} ignored",
+                            hex::encode_upper(&hash[..8])
+                        ));
+                        continue;
+                    }
+                    if !ids.insert(event.event_id) {
+                        diagnostics.push(format!(
+                            "record {record}: duplicate display event ID retained as inert metadata"
+                        ));
+                    }
+                    events.push(event);
+                }
                 Err(error) => diagnostics.push(format!("record {record}: {error:#}")),
             }
-        }
-        let mut ids = BTreeSet::new();
-        for event in &events {
-            ensure!(
-                ids.insert(event.event_id),
-                "duplicate event ID in vault log"
-            );
         }
         Ok(Self {
             events,
             diagnostics,
-            raw_records,
         })
     }
 
     pub fn append(&mut self, event: Event) -> Result<()> {
         event.verify_structure()?;
-        ensure!(
-            !self
-                .events
-                .iter()
-                .any(|item| item.event_id == event.event_id),
-            "duplicate event ID"
-        );
-        if self.raw_records.is_empty() && !self.events.is_empty() {
-            self.raw_records = self
-                .events
-                .iter()
-                .map(Event::encode)
-                .collect::<Result<Vec<_>>>()?;
+        let hash = event.verified_event_hash()?;
+        if self
+            .events
+            .iter()
+            .any(|item| item.verified_event_hash().ok() == Some(hash))
+        {
+            return Ok(());
         }
-        self.raw_records.push(event.encode()?);
+        if self
+            .events
+            .iter()
+            .any(|item| item.event_id == event.event_id)
+        {
+            self.diagnostics
+                .push("duplicate display event ID retained; event hashes remain unique".into());
+        }
         self.events.push(event);
         ensure!(
             self.encode()?.len() <= MAX_LOG_SIZE,
-            "vault log exceeds the size limit"
+            "vault event collection exceeds the size limit"
         );
         Ok(())
     }
+
+    pub fn union(&self, other: &Self) -> Result<Self> {
+        let local_root = self.genesis_hash()?;
+        let remote_root = other.genesis_hash()?;
+        if let (Some(local), Some(remote)) = (local_root, remote_root) {
+            ensure!(
+                local == remote,
+                "local and fetched event collections have different Genesis events"
+            );
+        }
+        let root = local_root.or(remote_root);
+        let mut by_hash = std::collections::BTreeMap::new();
+        for event in self.events.iter().chain(&other.events) {
+            event.verify_structure()?;
+            by_hash
+                .entry(event.verified_event_hash()?)
+                .or_insert_with(|| event.clone());
+        }
+        let mut events = Vec::with_capacity(by_hash.len());
+        if let Some(root) = root {
+            if let Some(event) = by_hash.remove(&root) {
+                events.push(event);
+            }
+        }
+        events.extend(by_hash.into_values());
+        let mut diagnostics = self.diagnostics.clone();
+        diagnostics.extend(other.diagnostics.iter().cloned());
+        diagnostics.sort();
+        diagnostics.dedup();
+        let merged = Self {
+            events,
+            diagnostics,
+        };
+        ensure!(
+            merged.encode()?.len() <= MAX_LOG_SIZE,
+            "merged event collection exceeds the size limit"
+        );
+        Ok(merged)
+    }
+
+    fn genesis_hash(&self) -> Result<Option<Hash>> {
+        self.events
+            .iter()
+            .find(|event| matches!(event.payload, EventPayload::Genesis(_)))
+            .map(Event::verified_event_hash)
+            .transpose()
+    }
+}
+
+fn put_event_record(output: &mut Vec<u8>, event: &Event) -> Result<()> {
+    let encoded = event.encode()?;
+    put_u32(output, encoded.len())?;
+    output.extend_from_slice(&encoded);
+    Ok(())
 }
 
 pub fn admission_binding_digest(
@@ -452,28 +483,18 @@ fn validate_payload(payload: &EventPayload) -> Result<()> {
         EventPayload::Genesis(epoch) | EventPayload::MembershipEpoch(epoch) => {
             validate_epoch(epoch)?
         }
-        EventPayload::Put {
-            key, ciphertext, ..
-        } => {
-            validate_key(key)?;
-            ensure!(!ciphertext.is_empty(), "encrypted value cannot be empty");
+        EventPayload::Mutation { ciphertext, .. } => {
             ensure!(
-                ciphertext.len() <= MAX_VALUE_SIZE + 16,
-                "encrypted value is too large"
+                !ciphertext.is_empty() && ciphertext.len() <= MAX_VALUE_SIZE + MAX_KEY_LEN + 64,
+                "invalid encrypted mutation size"
             );
         }
-        EventPayload::Delete { key, .. } => validate_key(key)?,
         EventPayload::CreateInvitation {
             invitation_id,
             pake_message,
             ..
         }
-        | EventPayload::InvitationResponse {
-            invitation_id,
-            pake_message,
-            ..
-        }
-        | EventPayload::ProposeUser {
+        | EventPayload::JoinProposal {
             invitation_id,
             pake_message,
             ..
@@ -488,11 +509,11 @@ fn validate_payload(payload: &EventPayload) -> Result<()> {
             ensure!(*invitation_id != [0; 16], "invitation ID cannot be zero");
         }
         EventPayload::Unknown { type_code, .. } => ensure!(
-            !(1..=8).contains(type_code),
+            !(1..=6).contains(type_code),
             "unknown event payload uses a reserved type code"
         ),
     }
-    if let EventPayload::ProposeUser { identity, .. } = payload {
+    if let EventPayload::JoinProposal { identity, .. } = payload {
         validate_member_identity(identity)?;
     }
     Ok(())
@@ -541,19 +562,7 @@ fn validate_epoch(epoch: &MembershipEpoch) -> Result<()> {
 fn validate_member_identity(identity: &MemberIdentity) -> Result<()> {
     validate_string(&identity.name, MAX_NAME_LEN, "member name")?;
     VerifyingKey::from_bytes(&identity.signing_public_key).context("invalid member Ed25519 key")?;
-    ensure!(
-        identity.certificate.len() <= MAX_CERTIFICATE_SIZE,
-        "device certificate is too large"
-    );
-    ensure!(
-        identity.certificate.is_empty(),
-        "device certificates are not accepted until X.509 binding verification is implemented"
-    );
     Ok(())
-}
-
-fn validate_key(key: &str) -> Result<()> {
-    validate_string(key, MAX_KEY_LEN, "secret key")
 }
 
 fn validate_string(value: &str, limit: usize, field: &str) -> Result<()> {
@@ -570,22 +579,14 @@ fn encode_payload(payload: &EventPayload) -> Result<Vec<u8>> {
         EventPayload::Genesis(epoch) | EventPayload::MembershipEpoch(epoch) => {
             encode_epoch(&mut output, epoch)?;
         }
-        EventPayload::Put {
+        EventPayload::Mutation {
             epoch_number,
-            key,
-            value_type,
             nonce,
             ciphertext,
         } => {
             put_u64(&mut output, *epoch_number);
-            put_string(&mut output, key)?;
-            output.push(value_type.encode());
             output.extend_from_slice(nonce);
             put_bytes(&mut output, ciphertext)?;
-        }
-        EventPayload::Delete { epoch_number, key } => {
-            put_u64(&mut output, *epoch_number);
-            put_string(&mut output, key)?;
         }
         EventPayload::CreateInvitation {
             epoch_number,
@@ -601,26 +602,13 @@ fn encode_payload(payload: &EventPayload) -> Result<Vec<u8>> {
         EventPayload::CloseInvitation { invitation_id } => {
             output.extend_from_slice(invitation_id);
         }
-        EventPayload::InvitationResponse {
-            epoch_number,
-            invitation_id,
-            proposal_event_hash,
-            pake_message,
-        } => {
-            put_u64(&mut output, *epoch_number);
-            output.extend_from_slice(invitation_id);
-            output.extend_from_slice(proposal_event_hash);
-            put_bytes(&mut output, pake_message)?;
-        }
-        EventPayload::ProposeUser {
+        EventPayload::JoinProposal {
             invitation_id,
             identity,
-            response_event_hash,
             pake_message,
         } => {
             output.extend_from_slice(invitation_id);
             encode_member_identity(&mut output, identity)?;
-            put_optional_hash(&mut output, response_event_hash);
             put_bytes(&mut output, pake_message)?;
         }
         EventPayload::Unknown { bytes, .. } => output.extend_from_slice(bytes),
@@ -633,36 +621,23 @@ fn decode_payload(type_code: u16, bytes: &[u8]) -> Result<EventPayload> {
     let payload = match type_code {
         1 => EventPayload::Genesis(decode_epoch(&mut decoder)?),
         2 => EventPayload::MembershipEpoch(decode_epoch(&mut decoder)?),
-        3 => EventPayload::Put {
+        3 => EventPayload::Mutation {
             epoch_number: decoder.u64()?,
-            key: decoder.string(MAX_KEY_LEN, "secret key")?,
-            value_type: ValueType::decode(decoder.u8()?)?,
             nonce: decoder.array()?,
-            ciphertext: decoder.bytes(MAX_VALUE_SIZE + 16, "encrypted value")?,
+            ciphertext: decoder.bytes(MAX_VALUE_SIZE + MAX_KEY_LEN + 64, "encrypted mutation")?,
         },
-        4 => EventPayload::Delete {
-            epoch_number: decoder.u64()?,
-            key: decoder.string(MAX_KEY_LEN, "secret key")?,
-        },
-        5 => EventPayload::CreateInvitation {
+        4 => EventPayload::CreateInvitation {
             epoch_number: decoder.u64()?,
             invitation_id: decoder.array()?,
             expires_at: decoder.u64()?,
             pake_message: decoder.bytes(MAX_PAKE_MESSAGE_SIZE, "PAKE message")?,
         },
-        6 => EventPayload::CloseInvitation {
+        5 => EventPayload::CloseInvitation {
             invitation_id: decoder.array()?,
         },
-        7 => EventPayload::ProposeUser {
+        6 => EventPayload::JoinProposal {
             invitation_id: decoder.array()?,
             identity: decode_member_identity(&mut decoder)?,
-            response_event_hash: decoder.optional_hash("proposal response")?,
-            pake_message: decoder.bytes(MAX_PAKE_MESSAGE_SIZE, "PAKE message")?,
-        },
-        8 => EventPayload::InvitationResponse {
-            epoch_number: decoder.u64()?,
-            invitation_id: decoder.array()?,
-            proposal_event_hash: decoder.array()?,
             pake_message: decoder.bytes(MAX_PAKE_MESSAGE_SIZE, "PAKE message")?,
         },
         _ => {
@@ -729,7 +704,6 @@ fn encode_member_identity(output: &mut Vec<u8>, identity: &MemberIdentity) -> Re
     put_string(output, &identity.name)?;
     output.extend_from_slice(&identity.signing_public_key);
     output.extend_from_slice(&identity.encryption_public_key);
-    put_bytes(output, &identity.certificate)?;
     Ok(())
 }
 
@@ -738,7 +712,6 @@ fn decode_member_identity(decoder: &mut Decoder<'_>) -> Result<MemberIdentity> {
         name: decoder.string(MAX_NAME_LEN, "member name")?,
         signing_public_key: decoder.array()?,
         encryption_public_key: decoder.array()?,
-        certificate: decoder.bytes(MAX_CERTIFICATE_SIZE, "device certificate")?,
     })
 }
 
@@ -884,16 +857,16 @@ mod tests {
             display_name: "Test".into(),
             encryption_public_key: [8; 32],
             signing_public_key: signing.verifying_key().to_bytes(),
-            certificate: Vec::new(),
         };
         let mut session = TestSession { identity, signing };
         Event::unsigned(
             [1; 32],
             [2; 32],
             session.identity.signing_public_key,
-            EventPayload::Delete {
+            EventPayload::Mutation {
                 epoch_number: 1,
-                key: "TOKEN".into(),
+                nonce: [3; 12],
+                ciphertext: vec![4; 16],
             },
         )
         .sign(&mut session)
@@ -908,7 +881,6 @@ mod tests {
         let log = EventLog {
             events: vec![event],
             diagnostics: Vec::new(),
-            raw_records: Vec::new(),
         };
         let encoded = log.encode().unwrap();
         let decoded = EventLog::decode(&encoded).unwrap();
@@ -946,23 +918,80 @@ mod tests {
         let appended = log.encode().unwrap();
         let decoded = EventLog::decode(&appended).unwrap();
         assert_eq!(decoded.events.len(), 2);
-        assert_eq!(decoded.diagnostics.len(), 1);
-        assert!(appended.windows(3).any(|window| window == b"bad"));
+        assert!(decoded.diagnostics.is_empty());
+        assert!(!appended.windows(3).any(|window| window == b"bad"));
     }
 
     #[test]
-    fn duplicate_ids_and_oversized_records_are_rejected() {
+    fn duplicate_hashes_are_diagnostic_and_oversized_records_are_rejected() {
         let valid = signed_event().encode().unwrap();
         let mut duplicate = LOG_MAGIC.to_vec();
         for _ in 0..2 {
             put_u32(&mut duplicate, valid.len()).unwrap();
             duplicate.extend_from_slice(&valid);
         }
-        assert!(EventLog::decode(&duplicate).is_err());
+        let decoded = EventLog::decode(&duplicate).unwrap();
+        assert_eq!(decoded.events.len(), 1);
+        assert_eq!(decoded.diagnostics.len(), 1);
 
         let mut oversized = LOG_MAGIC.to_vec();
         put_u32(&mut oversized, MAX_EVENT_SIZE + 1).unwrap();
         assert!(EventLog::decode(&oversized).is_err());
+    }
+
+    #[test]
+    fn duplicate_display_ids_do_not_invalidate_unique_event_hashes() {
+        let first = signed_event();
+        let signing = SigningKey::from_bytes(&[7; 32]);
+        let identity = DeviceIdentity {
+            backend: "test".into(),
+            locator: "1".into(),
+            display_name: "Test".into(),
+            encryption_public_key: [8; 32],
+            signing_public_key: signing.verifying_key().to_bytes(),
+        };
+        let mut session = TestSession { identity, signing };
+        let mut second = Event::unsigned(
+            [1; 32],
+            [2; 32],
+            session.identity.signing_public_key,
+            EventPayload::Mutation {
+                epoch_number: 1,
+                nonce: [9; 12],
+                ciphertext: vec![10; 16],
+            },
+        );
+        second.event_id = first.event_id;
+        let second = second.sign(&mut session).unwrap();
+        let mut encoded = LOG_MAGIC.to_vec();
+        put_event_record(&mut encoded, &first).unwrap();
+        put_event_record(&mut encoded, &second).unwrap();
+        let decoded = EventLog::decode(&encoded).unwrap();
+        assert_eq!(decoded.events.len(), 2);
+        assert_eq!(decoded.diagnostics.len(), 1);
+    }
+
+    #[test]
+    fn event_collection_union_is_commutative_and_preserves_candidates() {
+        let first = signed_event();
+        let second = signed_event();
+        let left = EventLog {
+            events: vec![first.clone()],
+            diagnostics: Vec::new(),
+        };
+        let right = EventLog {
+            events: vec![second.clone()],
+            diagnostics: Vec::new(),
+        };
+        let merged_left = left.union(&right).unwrap();
+        let merged_right = right.union(&left).unwrap();
+        assert_eq!(merged_left.events.len(), 2);
+        assert_eq!(
+            merged_left.encode().unwrap(),
+            merged_right.encode().unwrap()
+        );
+        assert!(merged_left.events.contains(&first));
+        assert!(merged_left.events.contains(&second));
     }
 
     #[test]
@@ -974,7 +1003,6 @@ mod tests {
             display_name: "Unknown".into(),
             encryption_public_key: [12; 32],
             signing_public_key: signing.verifying_key().to_bytes(),
-            certificate: Vec::new(),
         };
         let mut session = TestSession { identity, signing };
         let event = Event::unsigned(

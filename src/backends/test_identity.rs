@@ -1,15 +1,22 @@
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
+
 use anyhow::{ensure, Result};
 use ed25519_dalek::{Signer, SigningKey};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::identity::{
     DeviceIdentity, DiscoveredIdentity, IdentityBackend, IdentitySession, IdentityState,
+    VaultTrustRecord,
 };
 
 pub struct TestIdentityBackend {
     device: DeviceIdentity,
     signing: SigningKey,
     encryption: StaticSecret,
+    trust_records: Arc<Mutex<BTreeMap<String, VaultTrustRecord>>>,
 }
 
 impl TestIdentityBackend {
@@ -22,12 +29,12 @@ impl TestIdentityBackend {
             display_name: format!("Test identity {locator}"),
             encryption_public_key: PublicKey::from(&encryption).to_bytes(),
             signing_public_key: signing.verifying_key().to_bytes(),
-            certificate: Vec::new(),
         };
         Self {
             device,
             signing,
             encryption,
+            trust_records: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -62,6 +69,7 @@ impl IdentityBackend for TestIdentityBackend {
             device: self.device.clone(),
             signing: self.signing.clone(),
             encryption: self.encryption.clone(),
+            trust_records: Arc::clone(&self.trust_records),
         }))
     }
 }
@@ -70,6 +78,7 @@ pub struct TestIdentitySession {
     device: DeviceIdentity,
     signing: SigningKey,
     encryption: StaticSecret,
+    trust_records: Arc<Mutex<BTreeMap<String, VaultTrustRecord>>>,
 }
 
 impl IdentitySession for TestIdentitySession {
@@ -86,5 +95,21 @@ impl IdentitySession for TestIdentitySession {
             .encryption
             .diffie_hellman(&PublicKey::from(*peer_public_key))
             .to_bytes())
+    }
+
+    fn read_trust_record(&mut self, vault_name: &str) -> Result<Option<VaultTrustRecord>> {
+        Ok(self.trust_records.lock().unwrap().get(vault_name).cloned())
+    }
+
+    fn write_trust_record(&mut self, record: &VaultTrustRecord) -> Result<()> {
+        let mut records = self.trust_records.lock().unwrap();
+        if let Some(existing) = records.get(&record.vault_name) {
+            ensure!(
+                record.membership_epoch >= existing.membership_epoch,
+                "test checkpoint rollback"
+            );
+        }
+        records.insert(record.vault_name.clone(), record.clone());
+        Ok(())
     }
 }

@@ -11,7 +11,6 @@ pub struct DeviceIdentity {
     pub display_name: String,
     pub encryption_public_key: [u8; PUBLIC_KEY_SIZE],
     pub signing_public_key: [u8; PUBLIC_KEY_SIZE],
-    pub certificate: Vec<u8>,
 }
 
 impl DeviceIdentity {
@@ -62,6 +61,7 @@ impl DiscoveredIdentity {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VaultTrustRecord {
+    pub vault_name: String,
     pub vault_id: [u8; 32],
     pub membership_epoch: u64,
     pub membership_event_hash: [u8; 32],
@@ -83,7 +83,7 @@ pub trait IdentitySession {
         None
     }
 
-    fn read_trust_record(&mut self, _vault_id: &[u8; 32]) -> Result<Option<VaultTrustRecord>> {
+    fn read_trust_record(&mut self, _vault_name: &str) -> Result<Option<VaultTrustRecord>> {
         Ok(None)
     }
 

@@ -22,7 +22,7 @@ The interactive vault TUI derives a verified trusted projection, unlocks the cur
 
 Successful secret edits immediately append immutable, signed events.
 
-> **Early security prototype:** the event log, trusted replay, epoch encryption, Git plumbing, fork detection, Ed25519/X25519 hardware identities, and SPAKE2 onboarding are implemented and tested. The selected Rust SPAKE2 implementation has not received an independent audit. X.509 identity envelopes and persistent YubiKey membership checkpoints remain incomplete. Do not use this as the only copy of important secrets.
+> **Early security prototype:** deterministic trusted replay, encrypted mutations, Git event-set merging, persistent YubiKey membership checkpoints, Ed25519/X25519 hardware identities, and SPAKE2 onboarding are implemented and tested. The selected Rust SPAKE2 implementation has not received an independent audit, and the YubiKey checkpoint object still needs broader power-loss/endurance testing. Do not use this as the only copy of important secrets.
 
 ## Storage model
 
@@ -34,7 +34,7 @@ refs/vaults/staging
 refs/vaults/personal
 ```
 
-The ref points to a commit whose `vault.log` blob is a bounded, canonical, append-only binary event stream. It is not a worktree file. `git-vault` does not create `.nit` files and does not write arbitrary mutable files under `.git`.
+The ref points to a commit whose `vault.log` blob is a bounded, canonical set of immutable signed events. Event identity is the event hash; physical record ordering is irrelevant. It is not a worktree file. `git-vault` does not create `.nit` files and does not write arbitrary mutable files under `.git`.
 
 Additional refs are isolated by purpose:
 
@@ -53,7 +53,7 @@ Nuking through the manager removes the selected vault's local `refs/vaults/*`, f
 Anyone who can write Git objects may append candidate events. Every client independently computes the trusted projection:
 
 ```text
-raw event log
+untrusted event set
     -> bounded canonical parsing
     -> Ed25519 signature verification
     -> parent_trust_hash matching
@@ -61,11 +61,12 @@ raw event log
     -> derived trusted state
 ```
 
-The code uses three distinct validation levels:
+The code distinguishes:
 
 - **Structurally valid:** canonical fields and lengths are valid and the Ed25519 signature verifies.
-- **Invitation-authenticated proposal:** an owner has additionally verified the proposal's SPAKE2 phrase proof and explicit key confirmation.
 - **Trusted event:** the event extends the current trust hash and its signer was authorized for that event type by the previous trusted state.
+
+Join proposals remain structurally valid but inert until the invitation creator verifies SPAKE2 confirmation and signs the exact admission epoch.
 
 Structurally valid but unauthorized events remain inert. A removed member can continue appending mathematically valid signatures, but those events cannot extend the trusted state.
 
@@ -85,7 +86,7 @@ The current membership epoch contains:
 - one random epoch key wrapped independently to each member;
 - an authenticated encrypted snapshot of current typed values.
 
-Ordinary `Put` and `Delete` events use the current epoch key. They do not re-encrypt the whole vault.
+Ordinary edits append an encrypted `Mutation` under the current epoch key. The encrypted plaintext contains the operation, secret name, value type, and value; public events reveal only the epoch number, nonce, and ciphertext. Edits do not re-encrypt the whole vault.
 
 A membership transition creates a fresh epoch key and a fresh encrypted snapshot. A new member can decrypt the current logical state without receiving old epoch keys. A removed member receives no new key. Historical access cannot be revoked.
 
@@ -107,11 +108,11 @@ PIV slot 82   X25519 encryption/key agreement
 PIV slot 83   Ed25519 event signing
 ```
 
-Private keys remain on the device. PIN verification happens once per application session. X25519 unlock requires touch; newly provisioned Ed25519 signing keys use YubiKey's cached-touch policy so a burst of event appends does not require a touch for every event. Application code uses generic identity traits so software identities can exercise the security-critical replay and crypto code in tests.
+Private keys remain on the device. PIN verification happens once per application session. X25519 requires PIN-once and touch-always; Ed25519 requires PIN-once with touch-cached or touch-always. Existing keys with weaker policies are rejected. Application code uses generic identity traits so software identities can exercise the security-critical replay and crypto code in tests.
 
 The stable member identity is the Ed25519/X25519 public-key pair—not a serial number, Git identity, or certificate fingerprint. YubiKey serials are only local backend locators.
 
-A future PIV-native self-signed X.509 envelope may bind the two public keys and protocol metadata. It will not become a vault CA, revocation system, OCSP hierarchy, or general PKI.
+The current signed event format carries only the permanent Ed25519/X25519 public-key pair; it does not reserve an unused certificate field or define a general PKI.
 
 ## Usage
 
@@ -174,13 +175,13 @@ Push never forces the remote vault ref. Fetch first writes only to:
 refs/vault-remotes/origin/prod
 ```
 
-The fetched log is parsed, signatures and authorization are replayed, forks and local rollback are checked, and only then is `refs/vaults/prod` advanced with a compare-and-swap ref update.
+The fetched event set is parsed and unioned with the local set by event hash. The merged set is replayed, forks and rollback are checked, and a two-parent Git commit preserves both local and remote histories. Concurrent inert proposals therefore coexist, and a remote omission cannot delete a local event.
 
 Never configure `refs/vault-local/*` or `refs/vault-onboarding/*` for pushing. They contain local freshness and requester continuation state, respectively.
 
 ## Invitations and membership management
 
-The binary event model uses immutable `CreateInvitation`, `CloseInvitation`, and `ProposeUser` records. `git-vault` uses RustCrypto `spake2` 0.4 with Ed25519-group parameters and explicit HMAC key confirmation. This crate warns that it has not received an independent third-party audit; the decision and limits are recorded in [`docs/pake-review.md`](docs/pake-review.md).
+The binary event model uses immutable `CreateInvitation`, `CloseInvitation`, and `JoinProposal` records. `git-vault` uses RustCrypto `spake2` 0.4 with Ed25519-group parameters and explicit HMAC key confirmation. This crate warns that it has not received an independent third-party audit; the decision and limits are recorded in [`docs/pake-review.md`](docs/pake-review.md).
 
 The user-visible exchange is:
 
@@ -191,7 +192,7 @@ The user-visible exchange is:
 
 The owner chooses `member` or `owner` capability when creating the invitation. That capability is signed into the invitation, bound into requester key confirmation, enforced by trusted replay, and covered by the requester's final admission confirmation.
 
-The owner's resumable SPAKE2 state, including the phrase, is encrypted under the current membership epoch key. The public Git transcript provides no passive offline phrase verifier. Requester session state lives only under `refs/vault-onboarding/*` and contains no phrase.
+The owner's resumable SPAKE2 state is encrypted only to the invitation creator's X25519 YubiKey identity, and only that owner may admit its proposal. The public Git transcript provides no passive offline phrase verifier. Requester session keys under `refs/vault-onboarding/*` are likewise encrypted to the requester's permanent X25519 identity.
 
 When participants use different clones, they run `git vault <name> push`/`fetch` between these append steps. The PAKE protocol itself is transport-independent. In interactive mode, selecting an untrusted or provisionable YubiKey starts or resumes this invitation workflow instead of attempting to unlock the vault as a trusted member.
 
@@ -205,22 +206,24 @@ new membership epoch
 trusted membership hash
 ```
 
-A phrase proof remains inert until an existing owner verifies it and signs the membership epoch referencing that exact immutable proposal. A wrong phrase produces a different SPAKE2 key and fails requester confirmation. Each active owner verification permits one online phrase guess; the public transcript does not permit passive offline guessing.
+A phrase proof remains inert until the invitation creator verifies it and signs the membership epoch referencing that exact immutable proposal. A wrong phrase produces a different SPAKE2 key and fails requester confirmation. Each active owner verification permits one online phrase guess; the public transcript does not permit passive offline guessing.
+
+Wall-clock time is never an input to trusted replay. Expiry blocks new requests and owner approval only at interaction time; an admission remains permanently valid after its invitation expires. Expired invitations stay explicitly open—and count toward the invitation limit—until an owner signs `CloseInvitation`; the TUI labels them for closure.
 
 ## Rollback anchors
 
 Two independent mechanisms are designed:
 
 - `refs/vault-local/<vault>` detects ordinary trusted-state rollback on a machine that has previously accepted a newer state.
-- A YubiKey trust record will anchor the newest accepted membership epoch outside rollbackable Git.
+- A management-key-authenticated YubiKey trust object anchors the newest accepted membership epoch outside rollbackable Git.
 
-The local freshness ref is implemented. The generic hardware checkpoint interface and replay validation are implemented; persistent YubiKey checkpoint storage is not yet implemented, and vault creation reports that limitation explicitly. PIV object constraints and the required prototype are documented in [`docs/yubikey-checkpoint-feasibility.md`](docs/yubikey-checkpoint-feasibility.md).
+The YubiKey stores up to 16 canonically ordered vault-name/checkpoint records in PIV object `5FC10E`; it never silently evicts one. Creating a vault or accepting a newer membership epoch requires persisting and rereading this checkpoint. Failure aborts acceptance with a prominent error. This binds a familiar vault name to its permanent vault ID, membership event, and trust hash, so a replacement repository cannot silently establish another Genesis for that name.
 
-A fresh clone has neither checkpoint. It can verify signatures and authorization from Genesis but cannot independently know whether the repository omitted a newer valid suffix. This limitation is fundamental and documented rather than hidden.
+The management key is requested through the controlling terminal for checkpoint updates and is never cached or embedded. The object layout and remaining hardware-testing caveats are documented in [`docs/yubikey-checkpoint-feasibility.md`](docs/yubikey-checkpoint-feasibility.md).
 
 ## Binary format and limits
 
-The current prototype format uses `GVLOG002`/`GVEVT002`. The explicit binary codec is versioned, length-delimited, canonical, and independently frames each event. Prototype formats are not migrated or accepted as legacy input.
+The current prototype format uses `GVLOG003`/`GVEVT003`. The explicit binary codec is versioned, length-delimited, canonical, and independently frames each event. Prototype formats are not migrated or accepted as legacy input.
 
 ```text
 log magic
@@ -232,17 +235,17 @@ bounded canonical payload
 Ed25519 signature
 ```
 
-Unknown event types are structurally parseable but inert. Trailing fields, truncation, duplicate event IDs, malformed keys, invalid signatures, and oversized records are rejected or diagnosed without granting trust.
+Unknown event types are structurally parseable but inert. Trailing fields, truncation, malformed payloads, invalid signatures, and oversized records are rejected or diagnosed without granting trust. Duplicate display event IDs are diagnostic only; event hashes are the immutable set identity.
 
 Hard limits include:
 
-- 64 MiB complete log;
+- 64 MiB complete event collection;
 - 20 MiB event;
 - 16 MiB value/snapshot;
 - 64 members;
 - 32 active invitations;
 - 128 pending proposals;
-- bounded names, keys, PAKE messages, and certificates.
+- bounded encrypted mutations, names, and PAKE messages.
 
 A writer can still cause storage or download denial of service. Cryptography makes unauthorized data inert, not free.
 
@@ -278,7 +281,7 @@ nix run . -- prod --help
 nix flake check
 ```
 
-Linux builds require PC/SC development libraries, and runtime YubiKey access requires `pcscd`/CCID support. YubiKey firmware 5.7 or newer and a non-FIPS model are required for PIV Ed25519/X25519.
+Linux builds require PC/SC development libraries, and runtime YubiKey access requires `pcscd`/CCID support. YubiKey firmware 5.7.4 or newer and a non-FIPS model are required for PIV Ed25519/X25519 and enforceable key-policy metadata.
 
 ## Security-critical modules
 

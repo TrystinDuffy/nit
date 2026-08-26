@@ -184,6 +184,22 @@ pub fn require_terminal() -> Result<()> {
     Ok(())
 }
 
+pub fn suspend_terminal<T>(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    disable_raw_mode().context("cannot suspend terminal raw mode")?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)
+        .context("cannot suspend alternate screen")?;
+    terminal.show_cursor().ok();
+    let result = operation();
+    enable_raw_mode().context("cannot restore terminal raw mode")?;
+    execute!(terminal.backend_mut(), EnterAlternateScreen)
+        .context("cannot restore alternate screen")?;
+    terminal.clear().context("cannot clear restored terminal")?;
+    result
+}
+
 pub fn with_terminal<T>(
     operation: impl FnOnce(&mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<T>,
 ) -> Result<T> {

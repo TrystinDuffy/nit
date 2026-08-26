@@ -27,7 +27,7 @@ The `spake2` crate does not serialize its state object. It does expose `start_b_
 - a fresh 256-bit ChaCha20 RNG seed;
 - the random invitation phrase.
 
-Both are authenticated-encrypted under the current membership epoch key. Reconstructing role B with the same seed must reproduce the exact public invitation challenge before a join proof is accepted. The phrase and seed are never public Git fields.
+Both are authenticated-encrypted under a fresh state key that is wrapped only to the creating owner's permanent X25519 identity. Reconstructing role B with the same seed must reproduce the exact public invitation challenge before a join proof is accepted. Readers and other owners cannot recover the phrase or approve that invitation.
 
 Membership rotation invalidates all invitations and their encrypted owner state.
 
@@ -67,4 +67,4 @@ The implementation tests:
 - proposal inertia before owner admission;
 - admission of the exact proposal identity;
 - requester verification of exact admission confirmation;
-- local requester session-state Git refs.
+- requester session-state Git refs encrypted to the requester's X25519 identity.

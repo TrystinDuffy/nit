@@ -24,10 +24,18 @@ const WRAP_KDF_DOMAIN: &[u8] = b"git-vault/epoch-wrap-kdf/v1";
 const WRAP_AAD_DOMAIN: &[u8] = b"git-vault/epoch-wrap-aad/v1";
 const SNAPSHOT_AAD_DOMAIN: &[u8] = b"git-vault/snapshot-aad/v1";
 const PUT_AAD_DOMAIN: &[u8] = b"git-vault/put-aad/v1";
+const MUTATION_AAD_DOMAIN: &[u8] = b"git-vault/mutation-aad/v1";
 const PROTOCOL_STATE_AAD_DOMAIN: &[u8] = b"git-vault/protocol-state-aad/v1";
 const SNAPSHOT_MAGIC: &[u8; 8] = b"GVSNP001";
+const MUTATION_MAGIC: &[u8; 8] = b"GVMUT001";
 
 pub type EpochKey = Zeroizing<[u8; 32]>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DecryptedMutation {
+    Put { key: String, value: VaultValue },
+    Delete { key: String },
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum VaultValue {
@@ -302,6 +310,149 @@ pub fn decrypt_put(
     Ok(value)
 }
 
+pub fn encrypt_mutation(
+    vault_id: &VaultId,
+    epoch_number: u64,
+    mutation: &DecryptedMutation,
+    epoch_key: &[u8; 32],
+) -> Result<([u8; 12], Vec<u8>)> {
+    let mut plaintext = Zeroizing::new(encode_mutation(mutation)?);
+    let mut nonce = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce);
+    let ciphertext = encrypt(
+        epoch_key,
+        &nonce,
+        &plaintext,
+        &mutation_aad(vault_id, epoch_number),
+    )?;
+    plaintext.zeroize();
+    Ok((nonce, ciphertext))
+}
+
+pub fn decrypt_mutation(
+    vault_id: &VaultId,
+    epoch_number: u64,
+    nonce: &[u8; 12],
+    ciphertext: &[u8],
+    epoch_key: &[u8; 32],
+) -> Result<DecryptedMutation> {
+    let mut plaintext = Zeroizing::new(
+        decrypt(
+            epoch_key,
+            nonce,
+            ciphertext,
+            &mutation_aad(vault_id, epoch_number),
+        )
+        .context("cannot decrypt trusted mutation event")?,
+    );
+    let mutation = decode_mutation(&plaintext)?;
+    plaintext.zeroize();
+    Ok(mutation)
+}
+
+fn encode_mutation(mutation: &DecryptedMutation) -> Result<Vec<u8>> {
+    let mut output = MUTATION_MAGIC.to_vec();
+    match mutation {
+        DecryptedMutation::Put { key, value } => {
+            validate_secret_key(key)?;
+            output.push(1);
+            put_sized_bytes(&mut output, key.as_bytes())?;
+            output.push(encode_value_type(value.value_type()));
+            put_sized_bytes(&mut output, &value.as_bytes())?;
+        }
+        DecryptedMutation::Delete { key } => {
+            validate_secret_key(key)?;
+            output.push(2);
+            put_sized_bytes(&mut output, key.as_bytes())?;
+        }
+    }
+    ensure!(
+        output.len() <= MAX_VALUE_SIZE + MAX_KEY_LEN + 32,
+        "mutation plaintext is too large"
+    );
+    Ok(output)
+}
+
+fn decode_mutation(bytes: &[u8]) -> Result<DecryptedMutation> {
+    ensure!(bytes.len() >= 9, "truncated mutation plaintext");
+    ensure!(
+        &bytes[..8] == MUTATION_MAGIC,
+        "invalid mutation plaintext magic"
+    );
+    let mut offset = 9usize;
+    let operation = bytes[8];
+    let key = String::from_utf8(take_sized_bytes(bytes, &mut offset, MAX_KEY_LEN)?.to_vec())
+        .context("mutation key is not UTF-8")?;
+    validate_secret_key(&key)?;
+    let mutation = match operation {
+        1 => {
+            let value_type = decode_value_type(*bytes.get(offset).context("missing value type")?)?;
+            offset += 1;
+            let value = VaultValue::from_bytes(
+                value_type,
+                take_sized_bytes(bytes, &mut offset, MAX_VALUE_SIZE)?.to_vec(),
+            )?;
+            DecryptedMutation::Put { key, value }
+        }
+        2 => DecryptedMutation::Delete { key },
+        _ => bail!("unknown mutation operation {operation}"),
+    };
+    ensure!(offset == bytes.len(), "trailing mutation plaintext data");
+    Ok(mutation)
+}
+
+fn validate_secret_key(key: &str) -> Result<()> {
+    ensure!(
+        !key.is_empty() && key.len() <= MAX_KEY_LEN && !key.contains('\0'),
+        "invalid secret key"
+    );
+    Ok(())
+}
+
+fn encode_value_type(value_type: ValueType) -> u8 {
+    match value_type {
+        ValueType::Text => 1,
+        ValueType::Number => 2,
+        ValueType::Boolean => 3,
+        ValueType::Bytes => 4,
+    }
+}
+
+fn decode_value_type(value: u8) -> Result<ValueType> {
+    match value {
+        1 => Ok(ValueType::Text),
+        2 => Ok(ValueType::Number),
+        3 => Ok(ValueType::Boolean),
+        4 => Ok(ValueType::Bytes),
+        _ => bail!("unknown mutation value type {value}"),
+    }
+}
+
+fn put_sized_bytes(output: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
+    let length = u32::try_from(bytes.len()).context("mutation field is too large")?;
+    output.extend_from_slice(&length.to_be_bytes());
+    output.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn take_sized_bytes<'a>(bytes: &'a [u8], offset: &mut usize, limit: usize) -> Result<&'a [u8]> {
+    let length_end = offset.checked_add(4).context("mutation length overflow")?;
+    let length_bytes = bytes
+        .get(*offset..length_end)
+        .context("truncated mutation length")?;
+    *offset = length_end;
+    let length = u32::from_be_bytes(length_bytes.try_into().expect("length checked")) as usize;
+    ensure!(length <= limit, "mutation field is too large");
+    let end = offset
+        .checked_add(length)
+        .context("mutation length overflow")?;
+    let field = bytes
+        .get(*offset..end)
+        .context("truncated mutation field")?;
+    *offset = end;
+    Ok(field)
+}
+
 fn derive_wrapping_key(
     vault_id: &VaultId,
     epoch_number: u64,
@@ -355,6 +506,14 @@ fn protocol_state_aad(context: &ProtocolStateContext<'_>) -> Vec<u8> {
     aad.extend_from_slice(context.reference_hash);
     aad.extend_from_slice(&(context.purpose.len() as u32).to_be_bytes());
     aad.extend_from_slice(context.purpose);
+    aad
+}
+
+fn mutation_aad(vault_id: &VaultId, epoch_number: u64) -> Vec<u8> {
+    let mut aad = Vec::new();
+    aad.extend_from_slice(MUTATION_AAD_DOMAIN);
+    aad.extend_from_slice(vault_id);
+    aad.extend_from_slice(&epoch_number.to_be_bytes());
     aad
 }
 
@@ -548,7 +707,6 @@ mod tests {
                 .verifying_key()
                 .to_bytes(),
             encryption_public_key,
-            certificate: Vec::new(),
         };
         let device = DeviceIdentity {
             backend: "test".into(),
@@ -556,7 +714,6 @@ mod tests {
             display_name: "Alice".into(),
             encryption_public_key,
             signing_public_key: member.signing_public_key,
-            certificate: Vec::new(),
         };
         let epoch_key = random_epoch_key();
         let wrapped = wrap_epoch_key(&[1; 32], 1, &member, &epoch_key).unwrap();
@@ -577,6 +734,19 @@ mod tests {
         assert_eq!(
             decrypt_snapshot(&[1; 32], 1, &snapshot, &epoch_key).unwrap(),
             values
+        );
+
+        let mutation = DecryptedMutation::Put {
+            key: "AWS_ROOT_PASSWORD".into(),
+            value: VaultValue::Text("hidden".into()),
+        };
+        let (nonce, ciphertext) = encrypt_mutation(&[1; 32], 1, &mutation, &epoch_key).unwrap();
+        assert!(!ciphertext
+            .windows("AWS_ROOT_PASSWORD".len())
+            .any(|window| window == b"AWS_ROOT_PASSWORD"));
+        assert_eq!(
+            decrypt_mutation(&[1; 32], 1, &nonce, &ciphertext, &epoch_key).unwrap(),
+            mutation
         );
     }
 }

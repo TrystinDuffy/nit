@@ -6,7 +6,7 @@ use std::{
 
 use crate::{
     cli::{Cli, Command},
-    crypto::{self, random_epoch_key, unwrap_epoch_key, VaultValue},
+    crypto::{self, random_epoch_key, unwrap_epoch_key, DecryptedMutation, VaultValue},
     event::{
         EpochMember, Event, EventLog, EventPayload, Hash, MemberIdentity, MembershipEpoch, Role,
     },
@@ -19,7 +19,7 @@ use crate::{
     state::{derive_trusted_state, DeriveOptions, TrustedState},
     terminal::{
         choose_identity, choose_option, discard_pending_input, discover_identities, event_to_input,
-        identity_backend, prompt_line, require_terminal, with_terminal,
+        identity_backend, prompt_line, require_terminal, suspend_terminal, with_terminal,
     },
     tui::{Effect, VaultUi},
 };
@@ -213,34 +213,41 @@ struct OpenVault {
 
 impl OpenVault {
     fn append_put(&mut self, key: String, value: VaultValue) -> Result<()> {
-        let (nonce, ciphertext) = crypto::encrypt_put(
+        let (nonce, ciphertext) = crypto::encrypt_mutation(
             &self.state.vault_id,
             self.state.membership_epoch,
-            &key,
-            &value,
+            &DecryptedMutation::Put {
+                key: key.clone(),
+                value: value.clone(),
+            },
             &self.epoch_key,
         )?;
         self.append_payload(
-            EventPayload::Put {
+            EventPayload::Mutation {
                 epoch_number: self.state.membership_epoch,
-                key: key.clone(),
-                value_type: value.value_type(),
                 nonce,
                 ciphertext,
             },
-            "append Put event",
+            "append encrypted Put mutation",
         )?;
         self.values.insert(key, value);
         Ok(())
     }
 
     fn append_delete(&mut self, key: String) -> Result<()> {
+        let (nonce, ciphertext) = crypto::encrypt_mutation(
+            &self.state.vault_id,
+            self.state.membership_epoch,
+            &DecryptedMutation::Delete { key: key.clone() },
+            &self.epoch_key,
+        )?;
         self.append_payload(
-            EventPayload::Delete {
+            EventPayload::Mutation {
                 epoch_number: self.state.membership_epoch,
-                key: key.clone(),
+                nonce,
+                ciphertext,
             },
-            "append Delete event",
+            "append encrypted Delete mutation",
         )?;
         self.values.remove(&key);
         Ok(())
@@ -262,6 +269,12 @@ impl OpenVault {
         let expires_at = now_unix()
             .checked_add(minutes.saturating_mul(60))
             .context("invitation expiration overflow")?;
+        let creator = self
+            .state
+            .member_for_signing_key(&self.identity.identity().signing_public_key)
+            .context("invitation creator is not a current member")?
+            .identity
+            .clone();
         let pake_message = invitation::create_registration(
             &self.state.vault_id,
             self.state.membership_epoch,
@@ -269,7 +282,7 @@ impl OpenVault {
             &invitation_id,
             &phrase,
             invited_role,
-            &self.epoch_key,
+            &creator,
         )?;
         self.append_payload(
             EventPayload::CreateInvitation {
@@ -292,22 +305,37 @@ impl OpenVault {
     }
 
     fn approve_proposal(&mut self, selector: &str) -> Result<()> {
-        let proposal = select_proposal(&self.state, selector, false)?.clone();
+        let proposal = select_proposal(&self.state, selector)?.clone();
         let invitation = self
             .state
             .active_invitations
             .get(&proposal.invitation_id)
             .context("proposal invitation is no longer active")?;
+        ensure!(
+            invitation.expires_at >= now_unix(),
+            "invitation expired before this phrase proof was approved"
+        );
+        ensure!(
+            invitation.creator_signing_key == self.identity.identity().signing_public_key,
+            "only the owner who created this invitation can approve its phrase proof"
+        );
+        let creator = self
+            .state
+            .member_for_signing_key(&invitation.creator_signing_key)
+            .context("invitation creator is no longer a member")?
+            .identity
+            .clone();
         let event = find_event(&self.log, &proposal.event_hash)?;
-        let EventPayload::ProposeUser { pake_message, .. } = &event.payload else {
+        let EventPayload::JoinProposal { pake_message, .. } = &event.payload else {
             unreachable!()
         };
-        let (_authentication, session_key, invited_role) = invitation::authenticate_proposal(
+        let (session_key, invited_role) = invitation::authenticate_proposal(
             &self.state.vault_id,
             invitation,
             pake_message,
             &proposal.identity,
-            &self.epoch_key,
+            &creator,
+            self.identity.as_mut(),
         )?;
         ensure!(
             self.state
@@ -366,9 +394,8 @@ impl OpenVault {
             "admit SPAKE2-authenticated member",
         )?;
         self.epoch_key = next_epoch_key;
-        let _ = self
-            .identity
-            .write_trust_record(&self.state.trusted_checkpoint());
+        advance_identity_checkpoint(self.identity.as_mut(), &self.state, &self.vault_name)
+            .context("member admitted, but the hardware checkpoint was not advanced")?;
         Ok(())
     }
 
@@ -448,9 +475,8 @@ impl OpenVault {
         };
         self.append_payload(EventPayload::MembershipEpoch(epoch), message)?;
         self.epoch_key = next_epoch_key;
-        let _ = self
-            .identity
-            .write_trust_record(&self.state.trusted_checkpoint());
+        advance_identity_checkpoint(self.identity.as_mut(), &self.state, &self.vault_name)
+            .context("membership changed, but the hardware checkpoint was not advanced")?;
         Ok(())
     }
 
@@ -463,10 +489,7 @@ impl OpenVault {
             .state
             .member_for_signing_key(&self.identity.identity().signing_public_key)
             .context("the selected identity is not a trusted member")?;
-        let requires_owner = !matches!(
-            &payload,
-            EventPayload::Put { .. } | EventPayload::Delete { .. }
-        );
+        let requires_owner = !matches!(&payload, EventPayload::Mutation { .. });
         ensure!(
             !requires_owner || member.role == Role::Owner,
             "only an owner can manage membership and invitations"
@@ -484,7 +507,6 @@ impl OpenVault {
         let next_state = derive_trusted_state(
             &next_log.events,
             &DeriveOptions {
-                now: now_unix(),
                 local_checkpoint: Some(self.state.current_trust_hash),
                 ..DeriveOptions::default()
             },
@@ -557,12 +579,21 @@ impl OpenVault {
                     Err(error) => app.set_status(format!("Delete not appended: {error:#}")),
                 },
                 Effect::RemoveMember { signing_public_key } => {
-                    match self.remove_member_by_signing_key(&signing_public_key) {
+                    let previous_epoch = self.state.membership_epoch;
+                    match suspend_terminal(terminal, || {
+                        self.remove_member_by_signing_key(&signing_public_key)
+                    }) {
                         Ok(()) => {
                             refresh_access_view(&mut app, &self.state);
                             app.set_status(
                                 "Member removed; epoch key rotated; invitations invalidated",
                             );
+                        }
+                        Err(error) if self.state.membership_epoch > previous_epoch => {
+                            refresh_access_view(&mut app, &self.state);
+                            app.set_status(format!(
+                                "DEGRADED SECURITY: membership changed but hardware checkpoint failed: {error:#}"
+                            ));
                         }
                         Err(error) => {
                             app.set_status(format!("Member not removed: {error:#}"));
@@ -596,12 +627,19 @@ impl OpenVault {
                     proposal_event_hash,
                 } => {
                     let selector = hex::encode_upper(proposal_event_hash);
-                    match self.approve_proposal(&selector) {
+                    let previous_epoch = self.state.membership_epoch;
+                    match suspend_terminal(terminal, || self.approve_proposal(&selector)) {
                         Ok(()) => {
                             refresh_access_view(&mut app, &self.state);
                             app.set_status(
                                 "Member admitted; epoch rotated; invitations invalidated",
                             );
+                        }
+                        Err(error) if self.state.membership_epoch > previous_epoch => {
+                            refresh_access_view(&mut app, &self.state);
+                            app.set_status(format!(
+                                "DEGRADED SECURITY: member admitted but hardware checkpoint failed: {error:#}"
+                            ));
                         }
                         Err(error) => app.set_status(format!("Member not admitted: {error:#}")),
                     }
@@ -675,9 +713,8 @@ fn create_vault(
     let commit_oid = repository.append_vault_log(vault_name, None, &log, "create vault")?;
     let state = derive_trusted_state(&log.events, &DeriveOptions::default())?;
     repository.write_local_checkpoint(vault_name, &state.current_trust_hash)?;
-    if let Err(error) = session.write_trust_record(&state.trusted_checkpoint()) {
-        eprintln!("Warning: hardware membership rollback checkpoint was not written: {error:#}");
-    }
+    advance_identity_checkpoint(session.as_mut(), &state, vault_name)
+        .context("vault was created, but its YubiKey checkpoint was not persisted")?;
     eprintln!(
         "Created refs/vaults/{vault_name} for {} [{}]",
         device.display_name,
@@ -834,7 +871,7 @@ fn admitted_local_proposal(
         };
         let proposal_hash = epoch.accepted_proposal?;
         let proposal = find_event(&stored.log, &proposal_hash).ok()?;
-        let EventPayload::ProposeUser { identity, .. } = &proposal.payload else {
+        let EventPayload::JoinProposal { identity, .. } = &proposal.payload else {
             return None;
         };
         if identity.signing_public_key != device.signing_public_key
@@ -908,8 +945,21 @@ fn unlock_vault(
     );
     let backend = identity_backend(&selected.backend)?;
     let mut identity = backend.open(&selected)?;
-    let hardware_checkpoint = identity.read_trust_record(&initial.vault_id)?;
-    let state = derive_with_checkpoints(repository, vault_name, &stored.log, hardware_checkpoint)?;
+    let hardware_checkpoint = identity.read_trust_record(vault_name)?;
+    let state = derive_with_checkpoints(
+        repository,
+        vault_name,
+        &stored.log,
+        hardware_checkpoint.clone(),
+    )?;
+    if hardware_checkpoint
+        .as_ref()
+        .is_none_or(|checkpoint| checkpoint.membership_epoch < state.membership_epoch)
+    {
+        advance_identity_checkpoint(identity.as_mut(), &state, vault_name).context(
+            "verified a newer membership epoch, but could not advance the YubiKey checkpoint",
+        )?;
+    }
     let member = state
         .member_for_public_keys(&device.signing_public_key, &device.encryption_public_key)
         .context("selected identity is not in the verified membership epoch")?;
@@ -985,10 +1035,9 @@ fn request_access(
         state.vault_id,
         state.current_trust_hash,
         device.signing_public_key,
-        EventPayload::ProposeUser {
+        EventPayload::JoinProposal {
             invitation_id: invitation.invitation_id,
             identity: proposed.clone(),
-            response_event_hash: None,
             pake_message: phrase_proof,
         },
     )
@@ -1008,7 +1057,11 @@ fn request_access(
         proposal_identity: proposed,
         session_key,
     };
-    let mut encoded = invitation::encode_client_session_state(&session_state)?;
+    let mut encoded = invitation::seal_client_session_state(
+        &state.vault_id,
+        state.membership_epoch,
+        &session_state,
+    )?;
     repository.write_onboarding_state(vault_name, &event_hash, &encoded)?;
     encoded.zeroize();
     println!("{}", hex::encode_upper(event_hash));
@@ -1027,16 +1080,43 @@ fn confirm_access(
     proposal_selector: &str,
 ) -> Result<OpenVault> {
     let final_event = select_event(&stored.log, proposal_selector, |event| {
-        matches!(event.payload, EventPayload::ProposeUser { .. })
+        matches!(event.payload, EventPayload::JoinProposal { .. })
     })?;
     let final_hash = final_event.event_hash()?;
-    let mut local = Zeroizing::new(repository.read_onboarding_state(vault_name, &final_hash)?);
-    let session = invitation::decode_client_session_state(&local)?;
-    local.zeroize();
+    let EventPayload::JoinProposal {
+        identity: proposal_identity,
+        ..
+    } = &final_event.payload
+    else {
+        unreachable!()
+    };
+    let selected = choose_identity(
+        discover_identities()?,
+        requested_identity,
+        false,
+        true,
+        "Select the newly admitted identity",
+    )?;
+    let IdentityState::Ready(device) = &selected.state else {
+        bail!("selected identity is not provisioned");
+    };
     ensure!(
-        session.final_proposal_hash == final_hash,
-        "local SPAKE2 session mismatch"
+        device.signing_public_key == proposal_identity.signing_public_key
+            && device.encryption_public_key == proposal_identity.encryption_public_key,
+        "selected identity is not the proposed identity"
     );
+    let backend = identity_backend(&selected.backend)?;
+    let mut identity = backend.open(&selected)?;
+    let mut local = Zeroizing::new(repository.read_onboarding_state(vault_name, &final_hash)?);
+    print_identity_hint(identity.as_ref(), IdentityOperation::Agree);
+    let session = invitation::open_client_session_state(
+        &final_event.vault_id,
+        &final_hash,
+        proposal_identity,
+        &local,
+        identity.as_mut(),
+    )?;
+    local.zeroize();
     let state = derive_with_checkpoints(repository, vault_name, &stored.log, None)?;
     let admission_event = stored
         .log
@@ -1071,23 +1151,6 @@ fn confirm_access(
             .is_some(),
         "admission event did not add the proposed identity"
     );
-    let selected = choose_identity(
-        discover_identities()?,
-        requested_identity,
-        false,
-        true,
-        "Select the newly admitted identity",
-    )?;
-    let IdentityState::Ready(device) = &selected.state else {
-        bail!("selected identity is not provisioned");
-    };
-    ensure!(
-        device.signing_public_key == session.proposal_identity.signing_public_key
-            && device.encryption_public_key == session.proposal_identity.encryption_public_key,
-        "selected identity is not the admitted identity"
-    );
-    let backend = identity_backend(&selected.backend)?;
-    let mut identity = backend.open(&selected)?;
     let member = state
         .member_for_public_keys(&device.signing_public_key, &device.encryption_public_key)
         .context("admitted identity is absent from the current membership epoch")?;
@@ -1100,9 +1163,8 @@ fn confirm_access(
         identity.as_mut(),
     )?;
     let values = state.unlock_values(&epoch_key)?;
-    if let Err(error) = identity.write_trust_record(&state.trusted_checkpoint()) {
-        eprintln!("Warning: hardware membership rollback checkpoint was not written: {error:#}");
-    }
+    advance_identity_checkpoint(identity.as_mut(), &state, vault_name)
+        .context("admission verified, but the hardware checkpoint was not advanced")?;
     repository.write_local_checkpoint(vault_name, &state.current_trust_hash)?;
     repository.delete_onboarding_state(vault_name, &final_hash)?;
     eprintln!(
@@ -1128,13 +1190,7 @@ fn append_candidate(
     event: Event,
     message: &str,
 ) -> Result<StoredLog> {
-    let before = derive_trusted_state(
-        &stored.log.events,
-        &DeriveOptions {
-            now: now_unix(),
-            ..DeriveOptions::default()
-        },
-    )?;
+    let before = derive_trusted_state(&stored.log.events, &DeriveOptions::default())?;
     ensure!(
         before.fork.is_none(),
         "cannot append while a trusted fork is unresolved"
@@ -1145,13 +1201,7 @@ fn append_candidate(
     );
     let mut log = stored.log.clone();
     log.append(event)?;
-    let after = derive_trusted_state(
-        &log.events,
-        &DeriveOptions {
-            now: now_unix(),
-            ..DeriveOptions::default()
-        },
-    )?;
+    let after = derive_trusted_state(&log.events, &DeriveOptions::default())?;
     ensure!(
         after.current_trust_hash == before.current_trust_hash && after.fork.is_none(),
         "untrusted candidate unexpectedly changed the trusted projection"
@@ -1174,6 +1224,24 @@ fn read_phrase(stdin: bool) -> Result<Zeroizing<String>> {
     Ok(phrase)
 }
 
+fn advance_identity_checkpoint(
+    identity: &mut dyn IdentitySession,
+    state: &TrustedState,
+    vault_name: &str,
+) -> Result<()> {
+    let desired = state.trusted_checkpoint(vault_name);
+    if let Some(existing) = identity.read_trust_record(vault_name)? {
+        ensure!(
+            existing.membership_epoch <= desired.membership_epoch,
+            "hardware checkpoint is newer than the verified membership epoch"
+        );
+        if existing == desired {
+            return Ok(());
+        }
+    }
+    identity.write_trust_record(&desired)
+}
+
 fn derive_with_checkpoints(
     repository: &GitRepository,
     vault_name: &str,
@@ -1184,10 +1252,8 @@ fn derive_with_checkpoints(
     let state = derive_trusted_state(
         &log.events,
         &DeriveOptions {
-            now: now_unix(),
             hardware_checkpoint,
             local_checkpoint,
-            invitation_authenticated_proposals: BTreeMap::new(),
         },
     )?;
     Ok(state)
@@ -1199,19 +1265,27 @@ fn fetch_and_advance(repository: &GitRepository, vault: &str, remote: &str) -> R
     let remote_log = repository
         .read_remote_vault(remote, vault)?
         .with_context(|| format!("remote {remote:?} has no vault {vault:?}"))?;
-    let state = derive_with_checkpoints(repository, vault, &remote_log.log, None)?;
+    let local_log = current
+        .as_ref()
+        .map(|stored| stored.log.clone())
+        .unwrap_or_default();
+    let merged_log = local_log.union(&remote_log.log)?;
+    let state = derive_with_checkpoints(repository, vault, &merged_log, None)?;
     ensure!(
         state.fork.is_none(),
-        "fetched vault contains an unresolved trusted fork"
+        "merged vault event collection contains an unresolved trusted fork"
     );
-    repository.advance_vault_ref(
+    repository.write_merged_vault_log(
         vault,
         current.as_ref().map(|stored| stored.commit_oid.as_str()),
         &remote_log.commit_oid,
+        &merged_log,
+        "merge fetched vault event set",
     )?;
     repository.write_local_checkpoint(vault, &state.current_trust_hash)?;
     println!(
-        "Verified and advanced refs/vaults/{vault} to trusted hash {}",
+        "Merged {} verified events into refs/vaults/{vault}; trusted hash {}",
+        merged_log.events.len(),
         hex::encode_upper(&state.current_trust_hash[..8])
     );
     Ok(())
@@ -1283,23 +1357,16 @@ fn select_invitation<'a>(
 fn select_proposal<'a>(
     state: &'a TrustedState,
     selector: &str,
-    require_final: bool,
 ) -> Result<&'a crate::state::PendingProposal> {
     let normalized = selector.to_ascii_uppercase();
     let matches = state
         .pending_proposals
         .iter()
-        .filter(|proposal| {
-            proposal.response_event_hash.is_some() == require_final
-                && hex::encode_upper(proposal.event_hash).starts_with(&normalized)
-        })
+        .filter(|proposal| hex::encode_upper(proposal.event_hash).starts_with(&normalized))
         .collect::<Vec<_>>();
     match matches.as_slice() {
         [proposal] => Ok(*proposal),
-        [] => bail!(
-            "no {} proposal matches {selector:?}",
-            if require_final { "final" } else { "starting" }
-        ),
+        [] => bail!("no join proposal matches {selector:?}"),
         _ => bail!("proposal selector {selector:?} is ambiguous"),
     }
 }
@@ -1375,7 +1442,6 @@ fn member_identity(device: &DeviceIdentity, name: String) -> MemberIdentity {
         name,
         signing_public_key: device.signing_public_key,
         encryption_public_key: device.encryption_public_key,
-        certificate: device.certificate.clone(),
     }
 }
 
@@ -1494,6 +1560,15 @@ mod integration_tests {
         assert!(!vault.values.contains_key("TOKEN"));
         let stored = repository.read_vault("test").unwrap().unwrap();
         assert_eq!(stored.log.events.len(), 3);
+        assert!(stored.log.events[1..]
+            .iter()
+            .all(|event| matches!(event.payload, EventPayload::Mutation { .. })));
+        assert!(!stored
+            .log
+            .encode()
+            .unwrap()
+            .windows("TOKEN".len())
+            .any(|window| window == b"TOKEN"));
         let replayed = derive_trusted_state(
             &stored.log.events,
             &DeriveOptions {
@@ -1580,10 +1655,9 @@ mod integration_tests {
             vault_id,
             vault.state.current_trust_hash,
             bob_device.signing_public_key,
-            EventPayload::ProposeUser {
+            EventPayload::JoinProposal {
                 invitation_id: invitation.invitation_id,
                 identity: bob_member,
-                response_event_hash: None,
                 pake_message: phrase_proof,
             },
         )
@@ -1603,14 +1677,7 @@ mod integration_tests {
         .unwrap();
         vault.commit_oid = stored.commit_oid;
         vault.log = stored.log;
-        vault.state = derive_trusted_state(
-            &vault.log.events,
-            &DeriveOptions {
-                now: now_unix(),
-                ..DeriveOptions::default()
-            },
-        )
-        .unwrap();
+        vault.state = derive_trusted_state(&vault.log.events, &DeriveOptions::default()).unwrap();
         assert_eq!(vault.state.members.len(), 1);
 
         vault

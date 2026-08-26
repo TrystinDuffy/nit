@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::BTreeMap,
+    path::Path,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use ratatui::{
     layout::{Constraint, Direction, Layout},
@@ -537,6 +541,9 @@ impl VaultUi {
                 member.identity.fingerprint()
             )));
         }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_secs());
         for invitation in &self.invitations {
             let protocol = if invitation::is_spake2_invitation(&invitation.pake_message) {
                 invitation
@@ -546,10 +553,14 @@ impl VaultUi {
             } else {
                 "obsolete PAKE — close"
             };
+            let expiry = if invitation.expires_at < now {
+                "expired — close explicitly".to_owned()
+            } else {
+                format!("expires {}", invitation.expires_at)
+            };
             items.push(ListItem::new(format!(
-                "  active invitation  {}  {protocol}  expires {}",
+                "  active invitation  {}  {protocol}  {expiry}",
                 hex::encode_upper(&invitation.invitation_id[..4]),
-                invitation.expires_at
             )));
         }
         for proposal in &self.proposals {
@@ -606,19 +617,7 @@ fn capability_label(role: Role) -> &'static str {
 }
 
 fn visible_proposals(proposals: Vec<PendingProposal>) -> Vec<PendingProposal> {
-    let finalized_responses = proposals
-        .iter()
-        .filter_map(|proposal| proposal.response_event_hash)
-        .collect::<Vec<_>>();
     proposals
-        .into_iter()
-        .filter(|proposal| {
-            proposal.response_event_hash.is_some()
-                || !proposal
-                    .owner_response_event_hash
-                    .is_some_and(|response| finalized_responses.contains(&response))
-        })
-        .collect()
 }
 
 impl Drop for VaultUi {

@@ -8,16 +8,25 @@ use spake2::{Ed25519Group, Identity, Password, Spake2};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
-    crypto::{decrypt_protocol_state, encrypt_protocol_state, EpochKey, ProtocolStateContext},
-    event::{admission_binding_digest, Hash, MemberIdentity, MembershipEpoch, Role, VaultId},
-    state::{InvitationState, ProposalAuthentication},
+    crypto::{
+        decrypt_protocol_state, encrypt_protocol_state, random_epoch_key, unwrap_epoch_key,
+        wrap_epoch_key, ProtocolStateContext,
+    },
+    event::{
+        admission_binding_digest, Hash, MemberIdentity, MembershipEpoch, Role, VaultId,
+        WrappedEpochKey,
+    },
+    identity::IdentitySession,
+    state::InvitationState,
 };
 
-const INVITATION_MAGIC: &[u8; 8] = b"GVSPKIN2";
+const INVITATION_MAGIC: &[u8; 8] = b"GVSPKIN3";
 const OWNER_STATE_MAGIC: &[u8; 8] = b"GVSPKOS1";
 const REPLY_MAGIC: &[u8; 8] = b"GVSPKRP1";
 const SESSION_STATE_MAGIC: &[u8; 8] = b"GVSPKSK1";
+const SESSION_ENVELOPE_MAGIC: &[u8; 8] = b"GVSPKSE1";
 const OWNER_STATE_PURPOSE: &[u8] = b"spake2-owner-state";
+const CLIENT_STATE_PURPOSE: &[u8] = b"spake2-client-session";
 const IDENTITY_DOMAIN: &[u8] = b"git-vault/spake2-identities/v1";
 const REQUESTER_CONFIRMATION_DOMAIN: &[u8] = b"git-vault/spake2-requester-confirmation/v1";
 const ADMISSION_CONFIRMATION_DOMAIN: &[u8] = b"git-vault/spake2-admission-confirmation/v1";
@@ -72,12 +81,17 @@ pub fn create_registration(
     invitation_id: &[u8; 16],
     phrase: &str,
     invited_role: Role,
-    epoch_key: &EpochKey,
+    creator: &MemberIdentity,
 ) -> Result<Vec<u8>> {
     validate_phrase(phrase)?;
     let mut seed = Zeroizing::new([0u8; 32]);
     OsRng.fill_bytes(seed.as_mut());
-    let (requester_id, owner_id) = spake_identities(vault_id, invitation_id, parent_trust_hash);
+    let (requester_id, owner_id) = spake_identities(
+        vault_id,
+        invitation_id,
+        parent_trust_hash,
+        &creator.signing_public_key,
+    );
     let (_, owner_message) = Spake2::<Ed25519Group>::start_b_with_rng(
         &Password::new(phrase.as_bytes()),
         &Identity::new(&requester_id),
@@ -92,6 +106,8 @@ pub fn create_registration(
     let mut owner_state = Zeroizing::new(OWNER_STATE_MAGIC.to_vec());
     owner_state.extend_from_slice(seed.as_ref());
     put_bytes(&mut owner_state, phrase.as_bytes())?;
+    let state_key = random_epoch_key();
+    let wrapped_state_key = wrap_epoch_key(vault_id, epoch_number, creator, &state_key)?;
     let (nonce, encrypted_owner_state) = encrypt_protocol_state(
         &ProtocolStateContext {
             vault_id,
@@ -101,7 +117,7 @@ pub fn create_registration(
             purpose: OWNER_STATE_PURPOSE,
         },
         &owner_state,
-        epoch_key,
+        &state_key,
     )?;
     owner_state.zeroize();
     seed.zeroize();
@@ -109,6 +125,9 @@ pub fn create_registration(
     let mut output = INVITATION_MAGIC.to_vec();
     output.push(encode_role(invited_role));
     put_bytes(&mut output, &owner_message)?;
+    output.extend_from_slice(&wrapped_state_key.ephemeral_public_key);
+    output.extend_from_slice(&wrapped_state_key.nonce);
+    put_bytes(&mut output, &wrapped_state_key.ciphertext)?;
     output.extend_from_slice(&nonce);
     put_bytes(&mut output, &encrypted_owner_state)?;
     ensure!(
@@ -131,6 +150,7 @@ pub fn start_proposal(
         vault_id,
         &invitation.invitation_id,
         &invitation.create_parent_trust_hash,
+        &invitation.creator_signing_key,
     );
     let (requester, requester_message) = Spake2::<Ed25519Group>::start_a(
         &Password::new(phrase.as_bytes()),
@@ -164,10 +184,23 @@ pub fn authenticate_proposal(
     invitation: &InvitationState,
     reply: &[u8],
     proposal_identity: &MemberIdentity,
-    epoch_key: &EpochKey,
-) -> Result<(ProposalAuthentication, Zeroizing<Vec<u8>>, Role)> {
+    creator: &MemberIdentity,
+    session: &mut dyn IdentitySession,
+) -> Result<(Zeroizing<Vec<u8>>, Role)> {
+    ensure!(
+        creator.signing_public_key == invitation.creator_signing_key
+            && session.identity().signing_public_key == invitation.creator_signing_key,
+        "only the invitation creator can verify this phrase proof"
+    );
     let invitation_record = decode_invitation(&invitation.pake_message)?;
     let reply = decode_reply(reply)?;
+    let state_key = unwrap_epoch_key(
+        vault_id,
+        invitation.epoch_number,
+        creator,
+        &invitation_record.wrapped_state_key,
+        session,
+    )?;
     let owner_state = decrypt_protocol_state(
         &ProtocolStateContext {
             vault_id,
@@ -178,13 +211,14 @@ pub fn authenticate_proposal(
         },
         &invitation_record.state_nonce,
         &invitation_record.encrypted_owner_state,
-        epoch_key,
+        &state_key,
     )?;
     let (seed, phrase) = decode_owner_state(&owner_state)?;
     let (requester_id, owner_id) = spake_identities(
         vault_id,
         &invitation.invitation_id,
         &invitation.create_parent_trust_hash,
+        &invitation.creator_signing_key,
     );
     let (owner, reconstructed_challenge) = Spake2::<Ed25519Group>::start_b_with_rng(
         &Password::new(&phrase),
@@ -210,18 +244,7 @@ pub fn authenticate_proposal(
         invitation_record.invited_role,
         &reply.confirmation,
     )?;
-    Ok((
-        ProposalAuthentication {
-            vault_id: *vault_id,
-            invitation_id: invitation.invitation_id,
-            invitation_event_hash: invitation.create_event_hash,
-            response_event_hash: invitation.create_event_hash,
-            signing_public_key: proposal_identity.signing_public_key,
-            encryption_public_key: proposal_identity.encryption_public_key,
-        },
-        session_key,
-        invitation_record.invited_role,
-    ))
+    Ok((session_key, invitation_record.invited_role))
 }
 
 pub fn admission_confirmation(
@@ -276,6 +299,92 @@ pub fn decode_client_session_state(bytes: &[u8]) -> Result<ClientSessionState> {
         session_key: Zeroizing::new(decoder.bytes(MAX_PAKE_FIELD, "SPAKE2 session key")?),
     };
     decoder.finish()?;
+    Ok(state)
+}
+
+pub fn seal_client_session_state(
+    vault_id: &VaultId,
+    epoch_number: u64,
+    state: &ClientSessionState,
+) -> Result<Zeroizing<Vec<u8>>> {
+    let plaintext = encode_client_session_state(state)?;
+    let state_key = random_epoch_key();
+    let wrapped_state_key =
+        wrap_epoch_key(vault_id, epoch_number, &state.proposal_identity, &state_key)?;
+    let (nonce, ciphertext) = encrypt_protocol_state(
+        &ProtocolStateContext {
+            vault_id,
+            epoch_number,
+            invitation_id: &state.invitation_id,
+            reference_hash: &state.final_proposal_hash,
+            purpose: CLIENT_STATE_PURPOSE,
+        },
+        &plaintext,
+        &state_key,
+    )?;
+    let mut output = Zeroizing::new(SESSION_ENVELOPE_MAGIC.to_vec());
+    output.extend_from_slice(&epoch_number.to_be_bytes());
+    output.extend_from_slice(&state.invitation_id);
+    output.extend_from_slice(&wrapped_state_key.ephemeral_public_key);
+    output.extend_from_slice(&wrapped_state_key.nonce);
+    put_bytes(&mut output, &wrapped_state_key.ciphertext)?;
+    output.extend_from_slice(&nonce);
+    put_bytes(&mut output, &ciphertext)?;
+    Ok(output)
+}
+
+pub fn open_client_session_state(
+    vault_id: &VaultId,
+    proposal_hash: &Hash,
+    proposal_identity: &MemberIdentity,
+    bytes: &[u8],
+    session: &mut dyn IdentitySession,
+) -> Result<ClientSessionState> {
+    let mut decoder = Decoder::new(bytes);
+    ensure!(
+        decoder.take(8)? == SESSION_ENVELOPE_MAGIC,
+        "local requester state is not hardware-encrypted; restart the join request"
+    );
+    let epoch_number = decoder.u64()?;
+    let invitation_id = decoder.array()?;
+    let wrapped_state_key = WrappedEpochKey {
+        ephemeral_public_key: decoder.array()?,
+        nonce: decoder.array()?,
+        ciphertext: decoder.bytes(64, "wrapped requester state key")?,
+    };
+    ensure!(
+        wrapped_state_key.ciphertext.len() == 48,
+        "invalid wrapped requester state key"
+    );
+    let nonce = decoder.array()?;
+    let ciphertext = decoder.bytes(MAX_PAKE_FIELD, "encrypted requester state")?;
+    decoder.finish()?;
+    let state_key = unwrap_epoch_key(
+        vault_id,
+        epoch_number,
+        proposal_identity,
+        &wrapped_state_key,
+        session,
+    )?;
+    let plaintext = decrypt_protocol_state(
+        &ProtocolStateContext {
+            vault_id,
+            epoch_number,
+            invitation_id: &invitation_id,
+            reference_hash: proposal_hash,
+            purpose: CLIENT_STATE_PURPOSE,
+        },
+        &nonce,
+        &ciphertext,
+        &state_key,
+    )?;
+    let state = decode_client_session_state(&plaintext)?;
+    ensure!(
+        state.invitation_id == invitation_id
+            && state.final_proposal_hash == *proposal_hash
+            && state.proposal_identity == *proposal_identity,
+        "hardware-encrypted requester state does not match the proposal"
+    );
     Ok(state)
 }
 
@@ -349,11 +458,11 @@ fn update_confirmation_binding(
     mac.update(&invitation.invitation_id);
     mac.update(&invitation.create_event_hash);
     mac.update(&invitation.create_parent_trust_hash);
+    mac.update(&invitation.creator_signing_key);
     mac.update(&[encode_role(invited_role)]);
     put_mac_bytes(mac, identity.name.as_bytes())?;
     mac.update(&identity.signing_public_key);
     mac.update(&identity.encryption_public_key);
-    put_mac_bytes(mac, &identity.certificate)?;
     put_mac_bytes(mac, requester_message)?;
     put_mac_bytes(mac, owner_message)
 }
@@ -377,8 +486,16 @@ fn spake_identities(
     vault_id: &VaultId,
     invitation_id: &[u8; 16],
     parent_trust_hash: &Hash,
+    creator_signing_key: &[u8; 32],
 ) -> (Vec<u8>, Vec<u8>) {
-    let common = [IDENTITY_DOMAIN, vault_id, invitation_id, parent_trust_hash].concat();
+    let common = [
+        IDENTITY_DOMAIN,
+        vault_id,
+        invitation_id,
+        parent_trust_hash,
+        creator_signing_key,
+    ]
+    .concat();
     (
         [common.as_slice(), b"/requester"].concat(),
         [common.as_slice(), b"/owner"].concat(),
@@ -388,6 +505,7 @@ fn spake_identities(
 struct InvitationRecord {
     invited_role: Role,
     owner_message: Vec<u8>,
+    wrapped_state_key: WrappedEpochKey,
     state_nonce: [u8; 12],
     encrypted_owner_state: Vec<u8>,
 }
@@ -401,12 +519,21 @@ fn decode_invitation(bytes: &[u8]) -> Result<InvitationRecord> {
     let record = InvitationRecord {
         invited_role: decode_role(decoder.u8()?)?,
         owner_message: decoder.bytes(SPAKE_MESSAGE_SIZE, "SPAKE2 owner challenge")?,
+        wrapped_state_key: WrappedEpochKey {
+            ephemeral_public_key: decoder.array()?,
+            nonce: decoder.array()?,
+            ciphertext: decoder.bytes(64, "wrapped invitation state key")?,
+        },
         state_nonce: decoder.array()?,
         encrypted_owner_state: decoder.bytes(MAX_PAKE_FIELD, "encrypted SPAKE2 owner state")?,
     };
     ensure!(
         record.owner_message.len() == SPAKE_MESSAGE_SIZE,
         "invalid SPAKE2 owner challenge size"
+    );
+    ensure!(
+        record.wrapped_state_key.ciphertext.len() == 48,
+        "invalid wrapped invitation state key"
     );
     decoder.finish()?;
     Ok(record)
@@ -451,7 +578,7 @@ fn encode_identity(output: &mut Vec<u8>, identity: &MemberIdentity) -> Result<()
     put_bytes(output, identity.name.as_bytes())?;
     output.extend_from_slice(&identity.signing_public_key);
     output.extend_from_slice(&identity.encryption_public_key);
-    put_bytes(output, &identity.certificate)
+    Ok(())
 }
 
 fn put_bytes(output: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
@@ -499,6 +626,10 @@ impl<'a> Decoder<'a> {
         Ok(self.take(1)?[0])
     }
 
+    fn u64(&mut self) -> Result<u64> {
+        Ok(u64::from_be_bytes(self.array()?))
+    }
+
     fn bytes(&mut self, limit: usize, field: &str) -> Result<Vec<u8>> {
         let length = u32::from_be_bytes(self.array()?) as usize;
         ensure!(length <= limit, "{field} is too large");
@@ -511,7 +642,6 @@ impl<'a> Decoder<'a> {
                 .context("member name is not UTF-8")?,
             signing_public_key: self.array()?,
             encryption_public_key: self.array()?,
-            certificate: self.bytes(16 * 1024, "device certificate")?,
         })
     }
 
@@ -531,27 +661,86 @@ mod tests {
 
     use super::*;
     use crate::{
-        crypto::random_epoch_key,
         event::{EncryptedSnapshot, MembershipEpoch},
+        identity::DeviceIdentity,
     };
 
-    fn identity() -> MemberIdentity {
-        let encryption = StaticSecret::from([44; 32]);
-        MemberIdentity {
-            name: "Bob".into(),
-            signing_public_key: SigningKey::from_bytes(&[43; 32]).verifying_key().to_bytes(),
-            encryption_public_key: PublicKey::from(&encryption).to_bytes(),
-            certificate: Vec::new(),
+    struct CreatorSession {
+        device: DeviceIdentity,
+        encryption: StaticSecret,
+    }
+
+    impl IdentitySession for CreatorSession {
+        fn identity(&self) -> &DeviceIdentity {
+            &self.device
+        }
+
+        fn sign(&mut self, _message: &[u8; 32]) -> Result<[u8; 64]> {
+            unreachable!()
+        }
+
+        fn agree(&mut self, peer_public_key: &[u8; 32]) -> Result<[u8; 32]> {
+            Ok(self
+                .encryption
+                .diffie_hellman(&PublicKey::from(*peer_public_key))
+                .to_bytes())
         }
     }
 
-    fn invitation(pake_message: Vec<u8>) -> InvitationState {
+    fn creator() -> (MemberIdentity, CreatorSession) {
+        let signing_public_key = SigningKey::from_bytes(&[41; 32]).verifying_key().to_bytes();
+        let encryption = StaticSecret::from([42; 32]);
+        let encryption_public_key = PublicKey::from(&encryption).to_bytes();
+        (
+            MemberIdentity {
+                name: "Alice".into(),
+                signing_public_key,
+                encryption_public_key,
+            },
+            CreatorSession {
+                device: DeviceIdentity {
+                    backend: "test".into(),
+                    locator: "alice".into(),
+                    display_name: "Alice".into(),
+                    encryption_public_key,
+                    signing_public_key,
+                },
+                encryption,
+            },
+        )
+    }
+
+    fn identity() -> (MemberIdentity, CreatorSession) {
+        let signing_public_key = SigningKey::from_bytes(&[43; 32]).verifying_key().to_bytes();
+        let encryption = StaticSecret::from([44; 32]);
+        let encryption_public_key = PublicKey::from(&encryption).to_bytes();
+        (
+            MemberIdentity {
+                name: "Bob".into(),
+                signing_public_key,
+                encryption_public_key,
+            },
+            CreatorSession {
+                device: DeviceIdentity {
+                    backend: "test".into(),
+                    locator: "bob".into(),
+                    display_name: "Bob".into(),
+                    encryption_public_key,
+                    signing_public_key,
+                },
+                encryption,
+            },
+        )
+    }
+
+    fn invitation(pake_message: Vec<u8>, creator_signing_key: [u8; 32]) -> InvitationState {
         InvitationState {
             epoch_number: 1,
             invitation_id: [3; 16],
             expires_at: u64::MAX,
             create_event_hash: [4; 32],
             create_parent_trust_hash: [2; 32],
+            creator_signing_key,
             invited_role: Some(Role::Owner),
             pake_message,
         }
@@ -560,7 +749,7 @@ mod tests {
     #[test]
     fn spake2_invitation_round_trip_wrong_phrase_and_admission_confirmation() {
         let vault_id = [1; 32];
-        let epoch_key = random_epoch_key();
+        let (creator, mut creator_session) = creator();
         let phrase = "abandon ability able about";
         let record = create_registration(
             &vault_id,
@@ -569,17 +758,47 @@ mod tests {
             &[3; 16],
             phrase,
             Role::Owner,
-            &epoch_key,
+            &creator,
         )
         .unwrap();
-        let invitation = invitation(record);
-        let proposed = identity();
+        let invitation = invitation(record, creator.signing_public_key);
+        let (proposed, mut requester_session) = identity();
         let (reply, requester_key) =
             start_proposal(&vault_id, &invitation, &proposed, phrase).unwrap();
-        let (_, owner_key, invited_role) =
-            authenticate_proposal(&vault_id, &invitation, &reply, &proposed, &epoch_key).unwrap();
+        let (owner_key, invited_role) = authenticate_proposal(
+            &vault_id,
+            &invitation,
+            &reply,
+            &proposed,
+            &creator,
+            &mut creator_session,
+        )
+        .unwrap();
         assert_eq!(&*requester_key, &*owner_key);
         assert_eq!(invited_role, Role::Owner);
+
+        let client_state = ClientSessionState {
+            invitation_id: invitation.invitation_id,
+            invitation_event_hash: invitation.create_event_hash,
+            final_proposal_hash: [45; 32],
+            proposal_identity: proposed.clone(),
+            session_key: requester_key.clone(),
+        };
+        let envelope = seal_client_session_state(&vault_id, 1, &client_state).unwrap();
+        assert!(!envelope
+            .windows(requester_key.len())
+            .any(|window| window == requester_key.as_slice()));
+        assert_eq!(
+            open_client_session_state(
+                &vault_id,
+                &[45; 32],
+                &proposed,
+                &envelope,
+                &mut requester_session,
+            )
+            .unwrap(),
+            client_state
+        );
 
         let (wrong_reply, _) = start_proposal(
             &vault_id,
@@ -588,10 +807,15 @@ mod tests {
             "absorb abstract absurd abuse",
         )
         .unwrap();
-        assert!(
-            authenticate_proposal(&vault_id, &invitation, &wrong_reply, &proposed, &epoch_key,)
-                .is_err()
-        );
+        assert!(authenticate_proposal(
+            &vault_id,
+            &invitation,
+            &wrong_reply,
+            &proposed,
+            &creator,
+            &mut creator_session,
+        )
+        .is_err());
 
         let mut substituted_invitation = invitation.clone();
         substituted_invitation.create_event_hash[0] ^= 1;
@@ -600,7 +824,8 @@ mod tests {
             &substituted_invitation,
             &reply,
             &proposed,
-            &epoch_key,
+            &creator,
+            &mut creator_session,
         )
         .is_err());
         let mut substituted_identity = proposed.clone();
@@ -610,7 +835,8 @@ mod tests {
             &invitation,
             &reply,
             &substituted_identity,
-            &epoch_key,
+            &creator,
+            &mut creator_session,
         )
         .is_err());
 
