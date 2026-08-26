@@ -78,12 +78,17 @@ impl fmt::Display for PivStatus {
 
 impl Error for PivStatus {}
 
+fn is_missing_data_object(status: u16) -> bool {
+    matches!(status, 0x6A82 | 0x6A88)
+}
+
 fn status_note(status: u16) -> &'static str {
     match status {
         0x6982 => " (PIN or management-key authentication required)",
         0x6983 => " (authentication method blocked)",
         0x6985 => " (operation denied or touch timed out)",
         0x6A80 => " (invalid command data)",
+        0x6A82 => " (file or data object not found)",
         0x6A88 => " (key or object not found)",
         0x6D00 => " (instruction unsupported by this firmware)",
         status if status & 0xFFF0 == 0x63C0 => " (incorrect PIN)",
@@ -445,7 +450,9 @@ impl YubiKey {
     fn read_trust_object(&self) -> Result<Option<Vec<u8>>> {
         let request = tlv(TAG_OBJECT_ID, TRUST_OBJECT_ID);
         let (response, status) = self.command_raw(0, INS_GET_DATA, 0x3F, 0xFF, &request)?;
-        if status == 0x6A88 {
+        // Firmware reports an absent optional data object as either
+        // FILE_NOT_FOUND or REFERENCE_DATA_NOT_FOUND depending on transport/version.
+        if is_missing_data_object(status) {
             return Ok(None);
         }
         if status != 0x9000 {
@@ -1159,6 +1166,13 @@ mod tests {
         let mut other = identity;
         other.signing_public_key[0] ^= 1;
         assert!(decode_trust_records(&encoded, &other).is_err());
+    }
+
+    #[test]
+    fn recognizes_both_missing_data_object_statuses() {
+        assert!(is_missing_data_object(0x6A82));
+        assert!(is_missing_data_object(0x6A88));
+        assert!(!is_missing_data_object(0x6982));
     }
 
     #[test]
