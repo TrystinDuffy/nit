@@ -84,6 +84,7 @@ fn status_note(status: u16) -> &'static str {
         0x6983 => " (authentication method blocked)",
         0x6985 => " (operation denied or touch timed out)",
         0x6A80 => " (invalid command data)",
+        0x6A82 => " (file or data object not found)",
         0x6A88 => " (key or object not found)",
         0x6D00 => " (instruction unsupported by this firmware)",
         status if status & 0xFFF0 == 0x63C0 => " (incorrect PIN)",
@@ -445,7 +446,9 @@ impl YubiKey {
     fn read_trust_object(&self) -> Result<Option<Vec<u8>>> {
         let request = tlv(TAG_OBJECT_ID, TRUST_OBJECT_ID);
         let (response, status) = self.command_raw(0, INS_GET_DATA, 0x3F, 0xFF, &request)?;
-        if status == 0x6A88 {
+        // Firmware reports an absent optional data object as either
+        // FILE_NOT_FOUND or REFERENCE_DATA_NOT_FOUND depending on transport/version.
+        if matches!(status, 0x6A82 | 0x6A88) {
             return Ok(None);
         }
         if status != 0x9000 {
