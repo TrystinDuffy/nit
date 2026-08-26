@@ -3,10 +3,17 @@
 `git-vault` is an append-only, Git-native, hardware-backed secret vault. When installed as `git-vault`, Git discovers it as a subcommand:
 
 ```sh
-git vault prod
+git vault        # repository vault manager
+git vault prod   # open one vault directly
 ```
 
-The interactive TUI derives a verified trusted projection, unlocks the current membership epoch with a YubiKey, and provides the familiar secret workflow:
+Running `git vault` without a name lists every vault in the repository. The manager can open a vault, create another, or nuke the selected local vault. Its keybindings are:
+
+```text
+<j>/<k> select  <Enter> open  <n> new  <d> nuke local  <q> quit
+```
+
+The interactive vault TUI derives a verified trusted projection, unlocks the current membership epoch with a YubiKey, and provides the familiar secret workflow:
 
 ```text
 <j>/<k> select  <n> new  <e> edit  <d> delete
@@ -19,10 +26,12 @@ Successful secret edits immediately append immutable, signed events.
 
 ## Storage model
 
-A vault is stored only through Git objects and a custom ref:
+Each vault is stored independently through Git objects and its own custom ref, so one repository may contain many vaults:
 
 ```text
 refs/vaults/prod
+refs/vaults/staging
+refs/vaults/personal
 ```
 
 The ref points to a commit whose `vault.log` blob is a bounded, canonical, append-only binary event stream. It is not a worktree file. `git-vault` does not create `.nit` files and does not write arbitrary mutable files under `.git`.
@@ -36,6 +45,8 @@ refs/vault-onboarding/<vault>/<event> requester-only PAKE session state
 ```
 
 Git stores, synchronizes, and retains history. Git commits, authors, timestamps, and ancestry do not decide event authorization.
+
+Nuking through the manager removes the selected vault's local `refs/vaults/*`, freshness, onboarding, and staged remote refs. It does not delete a remote repository's vault ref, and unreachable Git objects may remain recoverable until Git garbage collection. This is ref deletion, not guaranteed forensic erasure.
 
 ## Trust model
 
@@ -279,6 +290,7 @@ src/state.rs               pure trusted replay, authorization, forks, rollback c
 src/crypto.rs              epoch wrapping, snapshots, typed value AEAD
 src/identity.rs            backend-neutral hardware identity traits
 src/invitation.rs          SPAKE2 onboarding and admission confirmation
+src/manager.rs             repository-level vault list/create/nuke TUI
 src/backends/yubikey.rs    PC/SC and PIV implementation
 src/backends/test_identity.rs software identity for deterministic tests
 src/runtime.rs             command orchestration and immediate event appends

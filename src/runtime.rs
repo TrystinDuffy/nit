@@ -15,6 +15,7 @@ use crate::{
         self, DeviceIdentity, DiscoveredIdentity, IdentityOperation, IdentitySession, IdentityState,
     },
     invitation::{self, ClientSessionState},
+    manager::{self, ManagerAction},
     state::{derive_trusted_state, DeriveOptions, TrustedState},
     terminal::{
         choose_identity, choose_option, discard_pending_input, discover_identities, event_to_input,
@@ -27,22 +28,44 @@ use rand_core::{OsRng, RngCore};
 use zeroize::{Zeroize, Zeroizing};
 
 pub fn run(cli: Cli) -> Result<()> {
-    git::validate_vault_name(&cli.vault)?;
     let repository = GitRepository::discover(".")?;
+    let Some(vault) = cli.vault.clone() else {
+        ensure!(
+            cli.command.is_none(),
+            "a vault name is required when using a vault command"
+        );
+        return match manager::run(&repository)? {
+            Some(ManagerAction::Open(vault)) => {
+                let stored = repository
+                    .read_vault(&vault)?
+                    .with_context(|| format!("vault {vault:?} no longer exists"))?;
+                run_interactive_existing(&repository, &vault, stored, cli.identity.as_deref())
+            }
+            Some(ManagerAction::Create(vault)) => {
+                ensure!(
+                    repository.read_vault(&vault)?.is_none(),
+                    "vault {vault:?} already exists"
+                );
+                create_vault(&repository, &vault, cli.identity.as_deref())?.run_tui()
+            }
+            None => Ok(()),
+        };
+    };
+    git::validate_vault_name(&vault)?;
 
     if let Some(Command::Fetch { remote }) = &cli.command {
-        return fetch_and_advance(&repository, &cli.vault, remote);
+        return fetch_and_advance(&repository, &vault, remote);
     }
     if let Some(Command::Push { remote }) = &cli.command {
-        repository.push_vault(remote, &cli.vault)?;
-        println!("Pushed refs/vaults/{} to {remote}", cli.vault);
+        repository.push_vault(remote, &vault)?;
+        println!("Pushed refs/vaults/{vault} to {remote}");
         return Ok(());
     }
 
-    let stored = repository.read_vault(&cli.vault)?;
+    let stored = repository.read_vault(&vault)?;
     if matches!(cli.command, Some(Command::Verify)) {
-        let stored = stored.with_context(|| format!("vault {:?} does not exist", cli.vault))?;
-        let state = derive_with_checkpoints(&repository, &cli.vault, &stored.log, None)?;
+        let stored = stored.with_context(|| format!("vault {vault:?} does not exist"))?;
+        let state = derive_with_checkpoints(&repository, &vault, &stored.log, None)?;
         print_verification(&stored, &state);
         return Ok(());
     }
@@ -54,7 +77,7 @@ pub fn run(cli: Cli) -> Result<()> {
     {
         return request_access(
             &repository,
-            &cli.vault,
+            &vault,
             stored.context("vault does not exist")?,
             cli.identity.as_deref(),
             invitation,
@@ -65,7 +88,7 @@ pub fn run(cli: Cli) -> Result<()> {
     if let Some(Command::ConfirmAccess { proposal }) = &cli.command {
         return confirm_access(
             &repository,
-            &cli.vault,
+            &vault,
             stored.context("vault does not exist")?,
             cli.identity.as_deref(),
             proposal,
@@ -74,24 +97,18 @@ pub fn run(cli: Cli) -> Result<()> {
     }
     if cli.command.is_none() {
         if let Some(stored) = stored.clone() {
-            return run_interactive_existing(
-                &repository,
-                &cli.vault,
-                stored,
-                cli.identity.as_deref(),
-            );
+            return run_interactive_existing(&repository, &vault, stored, cli.identity.as_deref());
         }
     }
 
     let mut session = match stored {
-        Some(stored) => unlock_vault(&repository, &cli.vault, stored, cli.identity.as_deref())?,
+        Some(stored) => unlock_vault(&repository, &vault, stored, cli.identity.as_deref())?,
         None => {
             ensure!(
                 !matches!(cli.command, Some(Command::Members)),
-                "vault {:?} does not exist",
-                cli.vault
+                "vault {vault:?} does not exist"
             );
-            create_vault(&repository, &cli.vault, cli.identity.as_deref())?
+            create_vault(&repository, &vault, cli.identity.as_deref())?
         }
     };
     match cli.command {

@@ -45,6 +45,63 @@ impl GitRepository {
         &self.workdir
     }
 
+    pub fn list_vaults(&self) -> Result<Vec<String>> {
+        let prefix = "refs/vaults/";
+        let mut vaults = self
+            .list_refs(prefix)?
+            .into_iter()
+            .filter_map(|reference| reference.strip_prefix(prefix).map(str::to_owned))
+            .filter(|name| !name.contains('/') && validate_vault_name(name).is_ok())
+            .collect::<Vec<_>>();
+        vaults.sort();
+        vaults.dedup();
+        Ok(vaults)
+    }
+
+    /// Deletes all local refs owned by one vault. Remote repository refs and
+    /// unreachable Git objects are intentionally not deleted.
+    pub fn delete_vault(&self, vault: &str) -> Result<usize> {
+        validate_vault_name(vault)?;
+        let primary = vault_ref(vault);
+        let local = local_ref(vault);
+        let onboarding_prefix = format!("refs/vault-onboarding/{vault}/");
+        let mut references = self
+            .list_refs("refs/vaults/")?
+            .into_iter()
+            .filter(|reference| reference == &primary)
+            .chain(
+                self.list_refs("refs/vault-local/")?
+                    .into_iter()
+                    .filter(|reference| reference == &local),
+            )
+            .chain(self.list_refs(&onboarding_prefix)?)
+            .collect::<Vec<_>>();
+        references.extend(
+            self.list_refs("refs/vault-remotes/")?
+                .into_iter()
+                .filter(|reference| reference.rsplit('/').next() == Some(vault)),
+        );
+        references.sort();
+        references.dedup();
+        if references.is_empty() {
+            return Ok(0);
+        }
+        let mut transaction = String::from("start\n");
+        for reference in &references {
+            transaction.push_str("delete ");
+            transaction.push_str(reference);
+            transaction.push('\n');
+        }
+        transaction.push_str("prepare\ncommit\n");
+        let output = self.git_output(["update-ref", "--stdin"], Some(transaction.as_bytes()))?;
+        ensure!(
+            output.status.success(),
+            "cannot delete vault refs: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        Ok(references.len())
+    }
+
     pub fn read_vault(&self, vault: &str) -> Result<Option<StoredLog>> {
         validate_vault_name(vault)?;
         self.read_ref_log(&vault_ref(vault))
@@ -213,6 +270,16 @@ impl GitRepository {
             String::from_utf8_lossy(&output.stderr).trim()
         );
         Ok(())
+    }
+
+    fn list_refs(&self, prefix: &str) -> Result<Vec<String>> {
+        let output = self.git_text(["for-each-ref", "--format=%(refname)", prefix])?;
+        Ok(output
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect())
     }
 
     fn read_ref_log(&self, reference: &str) -> Result<Option<StoredLog>> {
@@ -416,6 +483,31 @@ mod tests {
             .delete_onboarding_state("prod", &[8; 32])
             .unwrap();
         assert!(repository.read_onboarding_state("prod", &[8; 32]).is_err());
+
+        repository
+            .append_vault_log("archive", None, &log, "create another vault")
+            .unwrap();
+        repository
+            .write_onboarding_state("prod", &[9; 32], b"pending")
+            .unwrap();
+        repository
+            .git_output(
+                [
+                    "update-ref",
+                    "refs/vault-remotes/origin/prod",
+                    first.as_str(),
+                ],
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            repository.list_vaults().unwrap(),
+            vec!["archive".to_owned(), "prod".to_owned()]
+        );
+        assert_eq!(repository.delete_vault("prod").unwrap(), 4);
+        assert!(repository.read_vault("prod").unwrap().is_none());
+        assert!(repository.read_local_checkpoint("prod").unwrap().is_none());
+        assert_eq!(repository.list_vaults().unwrap(), vec!["archive"]);
     }
 
     #[test]

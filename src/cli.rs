@@ -10,8 +10,8 @@ use crate::event::{Role, ValueType};
     about = "Append-only, Git-native, hardware-backed secret vault"
 )]
 pub struct Cli {
-    /// Vault name under refs/vaults/<name>
-    pub vault: String,
+    /// Vault name under refs/vaults/<name>; omit to open the repository vault manager
+    pub vault: Option<String>,
 
     /// Select an identity by backend and locator
     #[arg(long, value_name = "BACKEND:LOCATOR")]
