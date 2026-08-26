@@ -1,4 +1,7 @@
 /target/
+/dist/
+/result
+/test.nit
 *.swp
 *.tmp
 .DS_Store

@@ -9,7 +9,10 @@ use rand_core::{OsRng, RngCore};
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::crypto::Recipient;
+use crate::identity::{
+    decode_age_recipient, encode_age_recipient, AuthorizedRecipient, DiscoveredIdentity,
+    IdentityBackend, IdentityState, UnlockIdentity, X25519AgeIdentity, X25519KeyAgreement,
+};
 
 pub const DEFAULT_SLOT: u8 = 0x82;
 
@@ -71,6 +74,31 @@ fn status_note(status: u16) -> &'static str {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SlotInfo {
+    Empty,
+    X25519([u8; 32]),
+    Other(u8),
+    Unavailable(String),
+}
+
+impl SlotInfo {
+    pub fn description(&self) -> String {
+        match self {
+            Self::Empty => "slot 82 empty".into(),
+            Self::X25519(_) => "slot 82 X25519".into(),
+            Self::Other(algorithm) => format!("slot 82 occupied by algorithm {algorithm:02X}"),
+            Self::Unavailable(error) => format!("slot 82 unavailable: {error}"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeviceInfo {
+    pub serial: u32,
+    pub slot: SlotInfo,
+}
+
 pub struct YubiKey {
     card: Card,
     version: [u8; 3],
@@ -128,6 +156,42 @@ impl YubiKey {
         found.context("no YubiKey with an enabled PIV application was found")
     }
 
+    pub fn list_devices() -> Result<Vec<DeviceInfo>> {
+        let context = PcscContext::establish(Scope::User)
+            .context("cannot access the operating system smart-card service")?;
+        let readers = context
+            .list_readers_owned()
+            .context("cannot enumerate smart-card readers")?;
+        let mut devices = Vec::new();
+        for reader in readers {
+            let Ok(card) = context.connect(&reader, ShareMode::Shared, Protocols::ANY) else {
+                continue;
+            };
+            let Ok(candidate) = Self::from_card(card) else {
+                continue;
+            };
+            let slot = match candidate.slot_metadata(DEFAULT_SLOT) {
+                Ok(None) => SlotInfo::Empty,
+                Ok(Some((ALG_X25519, public_key))) if public_key.len() == 32 => {
+                    SlotInfo::X25519(public_key.try_into().expect("length checked"))
+                }
+                Ok(Some((algorithm, _))) => SlotInfo::Other(algorithm),
+                Err(error) => SlotInfo::Unavailable(format!("{error:#}")),
+            };
+            if !devices
+                .iter()
+                .any(|device: &DeviceInfo| device.serial == candidate.serial)
+            {
+                devices.push(DeviceInfo {
+                    serial: candidate.serial,
+                    slot,
+                });
+            }
+        }
+        devices.sort_by_key(|device| device.serial);
+        Ok(devices)
+    }
+
     fn from_card(card: Card) -> Result<Self> {
         let mut key = Self {
             card,
@@ -168,7 +232,7 @@ impl YubiKey {
         }
     }
 
-    pub fn ensure_x25519_key(&mut self, slot: u8) -> Result<Recipient> {
+    pub fn ensure_x25519_key(&mut self, slot: u8) -> Result<[u8; 32]> {
         ensure!(
             self.version >= [5, 7, 0],
             "YubiKey firmware {}.{}.{} does not support PIV X25519; version 5.7 or newer is required",
@@ -184,11 +248,7 @@ impl YubiKey {
                 public_key.len() == 32,
                 "slot {slot:02x} has an invalid X25519 public key"
             );
-            return Ok(Recipient {
-                serial: self.serial,
-                slot,
-                public_key: public_key.try_into().expect("length checked"),
-            });
+            return Ok(public_key.try_into().expect("length checked"));
         }
 
         eprintln!("PIV slot {slot:02x} is empty and will receive a new X25519 key.");
@@ -204,12 +264,7 @@ impl YubiKey {
         input.zeroize();
         let management_algorithm = self.management_key_algorithm()?;
         self.authenticate_management_key(management_algorithm, &management_key)?;
-        let public_key = self.generate_x25519(slot)?;
-        Ok(Recipient {
-            serial: self.serial,
-            slot,
-            public_key,
-        })
+        self.generate_x25519(slot)
     }
 
     pub fn agree(&mut self, slot: u8, peer_public_key: &[u8; 32]) -> Result<[u8; 32]> {
@@ -221,7 +276,8 @@ impl YubiKey {
             ]
             .concat(),
         );
-        let response = self.command(0, INS_AUTHENTICATE, ALG_X25519, slot, &request)?;
+        let response =
+            Zeroizing::new(self.command(0, INS_AUTHENTICATE, ALG_X25519, slot, &request)?);
         let dynamic = find_tlv(&response, TAG_DYN_AUTH)
             .context("YubiKey key-agreement response lacks tag 7C")?;
         let secret = find_tlv(dynamic, TAG_AUTH_RESPONSE)
@@ -244,9 +300,9 @@ impl YubiKey {
         let algorithm = find_tlv(&response, TAG_METADATA_ALGORITHM)
             .and_then(|value| value.first().copied())
             .context("slot metadata lacks an algorithm")?;
-        let public_key = find_tlv(&response, TAG_METADATA_PUBLIC_KEY)
-            .context("slot metadata lacks a public key")?
-            .to_vec();
+        let encoded_public_key = find_tlv(&response, TAG_METADATA_PUBLIC_KEY)
+            .context("slot metadata lacks a public key")?;
+        let public_key = parse_device_public_key(encoded_public_key)?.to_vec();
         Ok(Some((algorithm, public_key)))
     }
 
@@ -359,13 +415,136 @@ impl YubiKey {
     }
 
     fn transmit(&self, apdu: &[u8]) -> Result<Vec<u8>> {
-        let mut receive = vec![0u8; 4096];
+        let mut receive = Zeroizing::new(vec![0u8; 4096]);
         let response = self
             .card
             .transmit(apdu, &mut receive)
             .context("smart-card transport failed")?;
         Ok(response.to_vec())
     }
+}
+
+pub struct YubiKeyBackend;
+
+impl IdentityBackend for YubiKeyBackend {
+    fn id(&self) -> &'static str {
+        "yubikey"
+    }
+
+    fn discover(&self) -> Result<Vec<DiscoveredIdentity>> {
+        YubiKey::list_devices()?
+            .into_iter()
+            .map(|device| {
+                let state = match &device.slot {
+                    SlotInfo::Empty => IdentityState::Provisionable,
+                    SlotInfo::X25519(public_key) => IdentityState::Ready {
+                        age_recipient: encode_age_recipient(public_key)?,
+                    },
+                    SlotInfo::Other(algorithm) => IdentityState::Unavailable(format!(
+                        "slot {DEFAULT_SLOT:02X} contains algorithm {algorithm:02X}"
+                    )),
+                    SlotInfo::Unavailable(error) => IdentityState::Unavailable(error.clone()),
+                };
+                Ok(DiscoveredIdentity {
+                    backend: self.id().into(),
+                    locator: device.serial.to_string(),
+                    display_name: format!("YubiKey {}", device.serial),
+                    detail: device.slot.description(),
+                    state,
+                })
+            })
+            .collect()
+    }
+
+    fn matches(&self, identity: &DiscoveredIdentity, recipient: &AuthorizedRecipient) -> bool {
+        identity.backend == self.id()
+            && recipient.backend == self.id()
+            && identity.locator == recipient.locator
+            && matches!(
+                &identity.state,
+                IdentityState::Ready { age_recipient }
+                    if age_recipient == &recipient.age_recipient
+            )
+    }
+
+    fn provision(
+        &self,
+        identity: &DiscoveredIdentity,
+        friendly_name: String,
+    ) -> Result<AuthorizedRecipient> {
+        ensure!(identity.backend == self.id(), "wrong identity backend");
+        ensure!(
+            identity.state.is_provisionable(),
+            "{} cannot be provisioned: {}",
+            identity.display_name,
+            identity.state.description()
+        );
+        let serial = parse_locator(&identity.locator)?;
+        let mut key = YubiKey::open(Some(serial))?;
+        let public_key = key.ensure_x25519_key(DEFAULT_SLOT)?;
+        Ok(AuthorizedRecipient {
+            name: friendly_name,
+            backend: self.id().into(),
+            locator: identity.locator.clone(),
+            age_recipient: encode_age_recipient(&public_key)?,
+        })
+    }
+
+    fn unlock(
+        &self,
+        identity: &DiscoveredIdentity,
+        recipient: &AuthorizedRecipient,
+        stanza_index: usize,
+    ) -> Result<Box<dyn UnlockIdentity>> {
+        ensure!(
+            self.matches(identity, recipient),
+            "identity does not match recipient"
+        );
+        let serial = parse_locator(&identity.locator)?;
+        let mut key = YubiKey::open(Some(serial))?;
+        let pin = Zeroizing::new(
+            rpassword::prompt_password("PIV PIN: ").context("failed to read PIV PIN")?,
+        );
+        ensure!(
+            !pin.is_empty(),
+            "an empty PIV PIN was not sent to the YubiKey"
+        );
+        key.verify_pin(&pin)?;
+        let public_key = decode_age_recipient(&recipient.age_recipient)?;
+        Ok(Box::new(X25519AgeIdentity::new(
+            Box::new(YubiKeyAgreement {
+                key,
+                slot: DEFAULT_SLOT,
+            }),
+            public_key,
+            stanza_index,
+        )))
+    }
+}
+
+struct YubiKeyAgreement {
+    key: YubiKey,
+    slot: u8,
+}
+
+impl X25519KeyAgreement for YubiKeyAgreement {
+    fn agree(&mut self, peer_public_key: &[u8; 32]) -> Result<[u8; 32]> {
+        self.key.agree(self.slot, peer_public_key)
+    }
+
+    fn prompt(&self) -> &str {
+        "Touch the YubiKey to unlock the vault…"
+    }
+}
+
+fn parse_locator(locator: &str) -> Result<u32> {
+    locator
+        .parse()
+        .with_context(|| format!("invalid YubiKey locator {locator:?}"))
+}
+
+fn parse_device_public_key(encoded: &[u8]) -> Result<&[u8]> {
+    find_tlv(encoded, 0x86).context("slot metadata has an invalid public-key encoding")
 }
 
 fn take_status(response: &mut Vec<u8>) -> Result<u16> {
@@ -470,6 +649,14 @@ mod tests {
         let encoded = tlv(0x7F49, &tlv(0x86, &[7; 32]));
         let inner = find_tlv(&encoded, 0x7F49).unwrap();
         assert_eq!(find_tlv(inner, 0x86), Some([7; 32].as_slice()));
+    }
+
+    #[test]
+    fn parses_x25519_key_from_slot_metadata() {
+        let key = [7u8; 32];
+        let encoded = tlv(TAG_METADATA_PUBLIC_KEY, &tlv(0x86, &key));
+        let metadata = find_tlv(&encoded, TAG_METADATA_PUBLIC_KEY).unwrap();
+        assert_eq!(parse_device_public_key(metadata).unwrap(), key);
     }
 
     #[test]

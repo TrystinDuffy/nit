@@ -1,14 +1,14 @@
 # nit
 
-`nit` is a tiny, single-executable secret vault backed by a YubiKey 5. It has one normal command shape:
+`nit` is a tiny, single-executable secret vault backed by YubiKey 5. A vault is opened with one command:
 
 ```text
-nit <file> [-k <keys>]
+nit [options] <file> [command]
 ```
 
-Opening a vault starts a terminal interface for creating, editing, deleting, and revealing named secrets. The optional `-k` argument feeds keys into the same state machine for automation.
+With no command, the terminal interface manages secrets, recipients, invitation slots, and access requests. Explicit subcommands provide stable automation without replaying UI keystrokes.
 
-> **Alpha security software:** the implementation has unit tests and uses standard constructions, but it has not received an independent security audit. Do not make it the only copy of irreplaceable credentials yet.
+> **Alpha security software:** `nit` uses standard age encryption and has unit tests, but it has not received an independent security audit. Do not make it the only copy of irreplaceable credentials yet.
 
 ## Requirements
 
@@ -18,16 +18,89 @@ Opening a vault starts a terminal interface for creating, editing, deleting, and
 
 Yubico documents X25519 as PIV algorithm `E1` and its firmware/model restrictions in the [YubiKey Technical Manual](https://docs.yubico.com/hardware/yubikey/yk-tech-manual/webdocs.pdf).
 
-## Build
+## Development workflow
+
+### Mise
+
+The repository pins Rust 1.87 in `mise.toml`. Bootstrap once, then use Make:
 
 ```sh
-cargo build --release
-install target/release/nit /usr/local/bin/nit
+make setup
+make check
 ```
 
-The deliverable is the single `target/release/nit` executable. Rust packages in `Cargo.toml` are compiled into that executable; users do not install them. `nit` does not execute or require `ykman`, `age`, `openssl`, a YubiKey plugin, a language runtime, or companion data files.
+The normal edit/test loop is:
 
-Like every application that talks to a smart card, it calls the operating system's smart-card interface. That system interface is the sole runtime boundary; `nit` does not bundle its own USB kernel driver.
+```sh
+make fmt
+make check
+make run ARGS='--help'
+make run ARGS='path/to/secrets.nit'
+```
+
+`make build` creates `target/debug/nit`. `make check` runs the formatting check, unit tests, and Clippy with warnings denied. Run `make help` for every target.
+
+If Rust is already managed without Mise, the Makefile uses the `cargo` and `rustc` on `PATH`. They can also be overridden explicitly:
+
+```sh
+make check CARGO=/path/to/cargo RUSTC=/path/to/rustc
+```
+
+### Nix
+
+The flake supplies Rust 1.87, `pkg-config`, and PC/SC development libraries on Linux:
+
+```sh
+nix develop       # enter the development shell
+nix build         # build ./result/bin/nit
+nix run . -- --help
+nix flake check   # build and run package tests
+```
+
+The host smart-card service still needs to be running when nit accesses a YubiKey.
+
+### Release builds and archives
+
+```sh
+make release       # build target/release/nit
+make dist          # build dist/nit-<version>-<host>.tar.gz
+make ci            # run all checks and create the dist tarball
+```
+
+`make dist` packages the optimized executable with `README.md` and `LICENSE`, then prints its path. The resulting executable is host-specific and still uses the operating system PC/SC interface.
+
+For a project release:
+
+1. Update `version` in `Cargo.toml` and refresh `Cargo.lock` with `cargo check`.
+2. Run `make ci` and exercise the physical YubiKey unlock/request flow.
+3. Commit, create a signed `v<version>` Git tag, and push it.
+4. Run `make dist` and attach the archive to the GitHub release.
+
+The crate has `publish = false`; releases are executable archives rather than crates.io publications.
+
+### Install
+
+Install for the current user without privilege escalation:
+
+```sh
+make install-user
+# installs $HOME/.local/bin/nit
+```
+
+Install system-wide:
+
+```sh
+sudo make install
+# installs /usr/local/bin/nit
+```
+
+Packaging systems can stage an installation without privilege escalation:
+
+```sh
+make install DESTDIR="$pkgdir" PREFIX=/usr
+```
+
+All Rust dependencies, including age, are compiled into the executable. Users do not install the `age` command, `ykman`, OpenSSL, a YubiKey plugin, or a language runtime. The operating system smart-card interface is the sole runtime boundary.
 
 ## First use
 
@@ -37,17 +110,38 @@ Insert one YubiKey and run:
 nit secrets.nit
 ```
 
-When the file does not exist, `nit` examines retired PIV slot `82`:
+For retired PIV slot `82`, nit will:
 
-- If slot `82` already contains an X25519 key, `nit` reuses it.
-- If it contains any other key type, `nit` stops. It never overwrites existing key material.
-- If it is empty, `nit` asks for the PIV management key and generates an X25519 key with PIN policy `once` and touch policy `always`.
+- Reuse an existing X25519 key.
+- Refuse to overwrite any other key type.
+- Otherwise ask for the PIV management key and generate an X25519 key with PIN policy `once` and touch policy `always`.
 
-Press Enter at the management-key prompt to use Yubico's factory management key. A custom management key is entered as hexadecimal. Key generation requires firmware 5.7+; the private key never leaves the YubiKey.
+Press Enter at the management-key prompt to use Yubico's factory management key. A custom management key is entered as hexadecimal. The private key never leaves the YubiKey.
 
-Losing or deleting the PIV private key makes the vault permanently unreadable. Slot `82` must be backed up by your own recovery strategy if the data cannot be recreated.
+A generated PIV key cannot be exported or backed up. Open an invitation and authorize at least one additional YubiKey if the vault needs recovery.
 
-## Interactive keys
+### Identity backends and multiple devices
+
+Nit's vault, crypto, UI, and command layer operate on backend-neutral identity records. The current `yubikey` backend inspects the serial number, slot type, and X25519 public key before asking for a PIN or touch:
+
+- One eligible identity is selected automatically.
+- Multiple usable identities always open an interactive `j`/`k` selector, including when only one is currently authorized for the vault.
+- When opening an existing vault, the selector marks each identity as authorized or not authorized.
+- Creating a vault or requesting access shows only identities that are ready or can be provisioned.
+- A YubiKey with a non-X25519 slot 82 is displayed as unavailable and is never overwritten.
+
+For commands, or to bypass the selector, use the stable `backend:locator` identity selector:
+
+```sh
+nit --identity yubikey:33127878 secrets.nit
+nit --identity yubikey:33127878 secrets.nit list
+```
+
+Commands require `--identity` when multiple eligible identities are discovered so automation remains deterministic.
+
+`src/identity.rs` defines backend-neutral discovery, provisioning, matching, and unlock traits plus the generic authorized-recipient record. Implementations live under `src/backends/`; PIV/APDU details are isolated in `src/backends/yubikey.rs`. A future macOS backend can use LocalAuthentication and a Keychain access-control policy to gate an age identity with Touch ID. Touch ID is an authorization mechanism rather than an age key itself, and no YubiKey fields need to leak into the vault format or application logic.
+
+## Secret keys
 
 | Key | Action |
 |---|---|
@@ -58,71 +152,129 @@ Losing or deleting the PIV private key makes the vault permanently unreadable. S
 | `d` | Delete the selected secret after confirmation |
 | `r` | Reveal or hide the selected value |
 | `y` | Queue the selected value for stdout after exit |
+| `a` | Manage recipients, invitations, and requests |
 | `q` | Quit |
 | Esc | Cancel the current prompt; quit from the list |
 
-Every successful creation, edit, or deletion is encrypted and atomically saved immediately. Quitting is not required to commit a change.
+Every successful change is encrypted and atomically saved immediately.
 
-## Key automation
+## Access keys
 
-Literal characters are typed as-is. These named tokens are supported:
+Press `a` from the secret list.
+
+| Key | Action |
+|---|---|
+| `j` / Down | Select next access record |
+| `k` / Up | Select previous access record |
+| `n` | Open an invitation slot |
+| `e` | Rename the selected recipient |
+| `d` | Remove the selected recipient after confirmation |
+| `a` | Approve the selected request |
+| `x` | Reject and remove the selected request |
+| `c` | Close the selected invitation |
+| Esc / `q` | Return to secrets |
+
+Recipient names are encrypted, authenticated display metadata. Authorization always uses the canonical X25519 public key and displayed fingerprint, never the friendly name. Nit refuses to remove the final recipient. Removing any other recipient affects newly saved versions only; that key can still decrypt historical versions it already obtained from Git.
+
+## Invitation slots
+
+An authorized user opens a slot with `a`, then `n`. Nit asks for:
+
+- A lifetime in minutes; the default is 30 and the maximum is seven days.
+- A phrase length from four to six words; the default is four.
+
+Words are selected uniformly with the operating-system CSPRNG from the 2048-word BIP-39 English list. They are not wallet mnemonics. Approximate entropy is 44, 55, or 66 bits. Four words plus the memory-hard KDF are the minimum accepted security level.
+
+The requester types the complete phrase on **one line**, with a space between each word, and presses Enter only after the final word. For example, if the owner shares:
 
 ```text
-<enter>  <esc>  <up>  <down>  <backspace>
-<tab>    <space> <lt>  <stdin>
+canvas oxygen trophy
 ```
 
-Create two values:
+the requester enters exactly `canvas oxygen trophy`, without quotes, commas, an invitation ID, or Enter between words. ASCII hyphens are also accepted in place of spaces.
+
+Each slot is one-use and permits three approval attempts. The phrase authenticates a request only: it never decrypts the vault.
+
+### Git request lifecycle
+
+1. An owner opens an invitation, commits the changed `.nit` file, and pushes it.
+2. The owner shares the invitation phrase verbally.
+3. The anticipated recipient pulls, opens the same `.nit` file, and selects the invitation.
+4. They type all invitation words on one line separated by spaces, press Enter once, and then enter a friendly identity name.
+5. Nit adds an encrypted request to that same `.nit` file without changing the encrypted vault payload.
+6. The requester commits and pushes the file.
+7. An owner pulls, unlocks the vault, and reviews the pending request.
+8. Approval adds the new identity, consumes the invitation, reseals the vault to every recipient, and removes the request.
+9. The owner commits and pushes; the new recipient pulls and can unlock.
+
+Nit does not execute Git. Repository operations remain explicit.
+
+Expiration is checked against the local clock whenever anyone opens the file. Unauthenticated users cannot submit against an expired slot. When an owner unlocks the vault, nit automatically closes expired invitations, removes their pending requests, reseals the authenticated payload, and atomically saves the cleanup. Git commit timestamps are not trusted proof that a request was made before expiration.
+
+### Invitation tamper resistance
+
+Each invitation derives independent binding and request keys with Argon2id using 64 MiB of memory, three passes, and a salt bound to the vault and invitation IDs. A public HMAC binds the vault ID, invitation ID, expiration, and request-inbox recipient.
+
+Before touching the requester's YubiKey, nit derives the phrase keys and verifies that binding in constant time. A repository writer who substitutes an inbox key or edits invitation metadata gets only a generic “incorrect phrase or tampered repository copy” failure. Owners also compare the public invitation records against the authenticated records after decrypting the vault.
+
+The public binding is necessarily an offline verifier, which is why nit now requires at least four random words and a memory-hard KDF. A request is additionally age-encrypted to the inbox and HMAC-bound to its vault, invitation, recipient, name, and nonce. Every failed owner approval consumes an attempt.
+
+A malicious writer can still delete requests, replay an old unexpired file, or create denial-of-service conflicts. Git review, branch protection, and expiry remain part of the security boundary.
+
+When a recipient is removed, nit rotates the inbox key and closes every invitation and pending request. This prevents former recipients who retained an old inbox key from reading future requests.
+
+## Command automation
+
+Automation uses explicit commands rather than replaying TUI keystrokes:
 
 ```sh
-nit secrets.nit -k 'nFOO<enter>bar<enter>nBAZ<enter>qux<enter>q'
+nit secrets.nit list
+nit secrets.nit get GITHUB_TOKEN
+printf '%s' "$TOKEN" | nit secrets.nit set GITHUB_TOKEN --stdin
+nit secrets.nit delete GITHUB_TOKEN
+
+nit secrets.nit invite --minutes 30 --words 4
+nit secrets.nit invitations
+nit secrets.nit recipients
+nit secrets.nit requests
+nit secrets.nit approve <request-id-prefix>
+nit secrets.nit reject <request-id-prefix>
 ```
 
-Output the first selected value:
+An unapproved recipient can submit a request without putting the phrase in process arguments:
 
 ```sh
-nit secrets.nit -k 'yq'
+printf '%s\n' 'canvas oxygen trophy velvet' |
+  nit --identity yubikey:33127878 secrets.nit request-access <invitation-id> \
+    --name 'Alice — Work YubiKey' --phrase-stdin
 ```
 
-Do not place real secret values directly in `-k`: command arguments can appear in shell history and process listings. Use `<stdin>` so the value is read from standard input without being reinterpreted as keys:
-
-```sh
-printf '%s' "$TOKEN" |
-  nit secrets.nit -k 'nGITHUB_TOKEN<enter><stdin><enter>q'
-```
-
-PIN and management-key prompts still read securely from the controlling terminal when stdin supplies a value.
+Secret values and phrases default to secure controlling-terminal prompts. `--stdin` and `--phrase-stdin` are explicit opt-ins for pipelines. PIN and management-key prompts always use the controlling terminal.
 
 ## Cryptographic design
 
-The YubiKey does not encrypt the vault contents directly. `nit` uses envelope encryption:
+A file begins with `NITVLT03` and contains two trust domains:
 
-1. Serialize the complete name/value map with strict size and duplicate checks.
-2. Generate a fresh random 256-bit file key and encrypt the map with XChaCha20-Poly1305.
-3. Generate an ephemeral X25519 key and ask the recipient public key to perform ECDH.
-4. Derive a wrapping key with HKDF-SHA256 using both public keys as the salt.
-5. Wrap the file key with XChaCha20-Poly1305.
-6. Authenticate the version, YubiKey serial hint, slot, public keys, nonces, and wrapped key as associated data.
+1. An age-encrypted payload containing secrets, approved recipients, friendly names, invitation keys, attempt counters, and the request-inbox private key.
+2. Strictly bounded public routing metadata, phrase-authenticated invitations, and age-encrypted access requests.
 
-On decryption, `nit` verifies the PIV PIN and asks the YubiKey to perform the private X25519 operation. The valuable private key remains non-exportable. Metadata such as the serial number is a device-selection hint and is not treated as secret.
+The vault payload uses standard age X25519 recipient stanzas and age's authenticated streaming payload format. Each approved identity receives the age file key independently. Backends implement discovery, provisioning, recipient matching, and unlock. The YubiKey backend adapts PIV ECDH to the standard age X25519 identity operation; future biometric or platform-key backends can provide the same interface.
 
-The file is a bounded binary format beginning with `NITVLT01`. It is intentionally not compatible with SOPS or age in version 1. This MVP supports one recipient per vault and encrypts the whole vault rather than individual fields.
+The complete `.nit` container is not directly accepted by the age CLI because nit's public invitation and request records wrap the embedded age payload. The age format and primitives are used internally rather than through an external process.
 
-Secret values, decrypted payload buffers, derived keys, management credentials, and file keys are zeroed when their owning buffers are dropped. Operating systems, terminal emulators, allocators, and crash dumps can still copy process memory; memory zeroization is defense in depth, not a guarantee that plaintext never existed elsewhere.
+Secret values, decrypted payloads, invitation phrases and keys, PINs, management credentials, ECDH outputs, and file keys are zeroed where their owning Rust buffers permit. Operating systems, terminal emulators, allocators, and crash dumps can still copy process memory; zeroization is defense in depth.
 
-## Repository safety
+## Repository safety and limitations
 
-Encrypted `.nit` files are intended to be committed. Plaintext export is explicit through reveal or `y`; redirect it carefully. A typical repository might contain:
+Encrypted `.nit` files are intended to be committed. Requests and public invitation metadata reveal no secret values, but they do reveal workflow activity and YubiKey routing metadata.
 
-```text
-secrets/
-  production.nit
-  staging.nit
-```
+- Removing a recipient cannot revoke old versions they already obtained from Git history.
+- Git rollback cannot be prevented by the vault alone. Signed commits, branch protection, and clients remembering newer generations can help detect it.
+- Concurrent modifications to the same binary `.nit` file can conflict and must be resolved by repeating the request against the latest version rather than byte-merging vault files.
+- Plaintext export is explicit through reveal or `y`; redirect it carefully.
 
 No plaintext temporary file is used by the built-in interface.
 
 ## License
 
 MIT
-
