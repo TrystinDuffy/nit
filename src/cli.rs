@@ -1,0 +1,126 @@
+use clap::{Parser, Subcommand, ValueEnum};
+
+use crate::event::{Role, ValueType};
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "git-vault",
+    bin_name = "git vault",
+    version,
+    about = "Append-only, Git-native, hardware-backed secret vault"
+)]
+pub struct Cli {
+    /// Vault name under refs/vaults/<name>
+    pub vault: String,
+
+    /// Select an identity by backend and locator
+    #[arg(long, value_name = "BACKEND:LOCATOR")]
+    pub identity: Option<String>,
+
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// List secret keys
+    List,
+    /// Print one secret value
+    Get { key: String },
+    /// Append a typed Put event
+    Set {
+        key: String,
+        #[arg(long, value_enum, default_value_t = CliValueType::Text)]
+        r#type: CliValueType,
+        /// Read the value from stdin instead of a secure terminal prompt
+        #[arg(long)]
+        stdin: bool,
+    },
+    /// Append a Delete event
+    Delete { key: String },
+    /// List trusted members
+    Members,
+    /// Create an OPAQUE invitation
+    Invite {
+        #[arg(long, default_value_t = 30)]
+        minutes: u64,
+        #[arg(long, default_value_t = 4)]
+        words: usize,
+    },
+    /// Close an active invitation
+    CloseInvitation { invitation: String },
+    /// Start an OPAQUE access proposal
+    RequestAccess {
+        invitation: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        phrase_stdin: bool,
+    },
+    /// Finish an OPAQUE proposal after an owner response
+    ContinueRequest {
+        proposal: String,
+        #[arg(long)]
+        phrase_stdin: bool,
+    },
+    /// Append the owner response for an OPAQUE proposal start
+    Respond { proposal: String },
+    /// Admit an invitation-authenticated final proposal as a reader
+    Approve { proposal: String },
+    /// Verify admission confirmation and checkpoint the new member
+    ConfirmAccess { proposal: String },
+    /// Remove a trusted member and rotate the membership epoch
+    RemoveMember { member: String },
+    /// Change a trusted member's role and rotate the membership epoch
+    SetRole {
+        member: String,
+        #[arg(value_enum)]
+        role: CliRole,
+    },
+    /// Verify and summarize the trusted projection without unlocking values
+    Verify,
+    /// Fetch into refs/vault-remotes/<remote>/<vault>, verify, then CAS-advance
+    Fetch {
+        #[arg(default_value = "origin")]
+        remote: String,
+    },
+    /// Push refs/vaults/<vault> without forcing
+    Push {
+        #[arg(default_value = "origin")]
+        remote: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum CliRole {
+    Reader,
+    Owner,
+}
+
+impl From<CliRole> for Role {
+    fn from(value: CliRole) -> Self {
+        match value {
+            CliRole::Reader => Self::Reader,
+            CliRole::Owner => Self::Owner,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum CliValueType {
+    Text,
+    Number,
+    Boolean,
+    Bytes,
+}
+
+impl From<CliValueType> for ValueType {
+    fn from(value: CliValueType) -> Self {
+        match value {
+            CliValueType::Text => Self::Text,
+            CliValueType::Number => Self::Number,
+            CliValueType::Boolean => Self::Boolean,
+            CliValueType::Bytes => Self::Bytes,
+        }
+    }
+}

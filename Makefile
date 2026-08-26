@@ -8,7 +8,7 @@ DESTDIR ?=
 DISTDIR ?= dist
 ARGS ?=
 
-.PHONY: all help setup doctor build run release test fmt fmt-check lint check ci install install-user dist clean tools
+.PHONY: all help setup doctor build run release test fmt fmt-check lint check fuzz-check ci install install-user dist clean tools
 
 all: release
 
@@ -20,9 +20,10 @@ help:
 	  '  make run ARGS="..."     Run the debug binary' \
 	  '  make fmt                Format Rust sources' \
 	  '  make check              Format check, tests, and Clippy' \
+	  '  make fuzz-check         Compile the bounded event-log fuzz target' \
 	  '' \
 	  'Release/install:' \
-	  '  make release            Build target/release/nit' \
+	  '  make release            Build target/release/git-vault' \
 	  '  make dist               Create a host tarball under dist/' \
 	  '  make ci                 Run checks and create the dist tarball' \
 	  '  sudo make install       Install under /usr/local by default' \
@@ -78,10 +79,13 @@ lint: tools
 
 check: fmt-check test lint
 
-ci: check dist
+fuzz-check: tools
+	$(CARGO) check --locked --manifest-path fuzz/Cargo.toml
+
+ci: check fuzz-check dist
 
 install: release
-	install -Dm755 target/release/nit "$(DESTDIR)$(BINDIR)/nit"
+	install -Dm755 target/release/git-vault "$(DESTDIR)$(BINDIR)/git-vault"
 
 install-user:
 	$(MAKE) install PREFIX="$(HOME)/.local"
@@ -90,15 +94,15 @@ dist: release
 	@set -eu; \
 	version=$$(awk -F '"' '/^version = / { print $$2; exit }' Cargo.toml); \
 	host=$$($(CARGO) -Vv | awk '/^host:/ { print $$2 }'); \
-	name="nit-$$version-$$host"; \
+	name="git-vault-$$version-$$host"; \
 	stage=$$(mktemp -d); \
 	trap 'rm -rf "$$stage"' EXIT HUP INT TERM; \
 	mkdir -p "$$stage/$$name" "$(DISTDIR)"; \
-	install -m755 target/release/nit "$$stage/$$name/nit"; \
+	install -m755 target/release/git-vault "$$stage/$$name/git-vault"; \
 	install -m644 README.md LICENSE "$$stage/$$name/"; \
 	tar -C "$$stage" -czf "$(DISTDIR)/$$name.tar.gz" "$$name"; \
 	printf 'Created %s\n' "$(DISTDIR)/$$name.tar.gz"
 
 clean: tools
 	$(CARGO) clean
-	rm -rf "$(DISTDIR)"
+	rm -rf "$(DISTDIR)" fuzz/target

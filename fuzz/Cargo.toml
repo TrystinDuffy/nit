@@ -1,0 +1,19 @@
+[package]
+name = "git-vault-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+git-vault = { path = ".." }
+
+[[bin]]
+name = "event_log"
+path = "fuzz_targets/event_log.rs"
+test = false
+doc = false
+bench = false

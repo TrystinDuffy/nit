@@ -1,5 +1,5 @@
 {
-  description = "nit — a YubiKey-backed encrypted secret vault";
+  description = "git-vault — an append-only, Git-native, hardware-backed secret vault";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -54,8 +54,8 @@
               in
               name != ".git" && name != "target";
           };
-          nit = rustPlatform.buildRustPackage {
-            pname = "nit";
+          gitVault = rustPlatform.buildRustPackage {
+            pname = "git-vault";
             version = "0.1.0";
             src = source;
 
@@ -64,10 +64,10 @@
             inherit nativeBuildInputs buildInputs;
 
             meta = {
-              description = "A tiny YubiKey-backed encrypted secret vault";
+              description = "An append-only, Git-native, hardware-backed secret vault";
               homepage = "https://github.com/TrystinDuffy/nit";
               license = pkgs.lib.licenses.mit;
-              mainProgram = "nit";
+              mainProgram = "git-vault";
               platforms = systems;
             };
           };
@@ -76,7 +76,7 @@
           inherit
             buildInputs
             nativeBuildInputs
-            nit
+            gitVault
             pkgs
             rustToolchain
             ;
@@ -84,19 +84,19 @@
     in
     {
       packages = forAllSystems (system: {
-        default = (perSystem system).nit;
-        nit = (perSystem system).nit;
+        default = (perSystem system).gitVault;
+        git-vault = (perSystem system).gitVault;
       });
 
       apps = forAllSystems (system: {
         default = {
           type = "app";
-          program = "${(perSystem system).nit}/bin/nit";
+          program = "${(perSystem system).gitVault}/bin/git-vault";
         };
       });
 
       checks = forAllSystems (system: {
-        default = (perSystem system).nit;
+        default = (perSystem system).gitVault;
       });
 
       devShells = forAllSystems (

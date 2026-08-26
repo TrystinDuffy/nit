@@ -1,4 +1,8 @@
-use std::{error::Error, fmt};
+use std::{
+    error::Error,
+    fmt,
+    time::{Duration, Instant},
+};
 
 use aes::{Aes128, Aes192, Aes256};
 use anyhow::{bail, ensure, Context, Result};
@@ -10,13 +14,15 @@ use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::identity::{
-    decode_age_recipient, encode_age_recipient, AuthorizedRecipient, DiscoveredIdentity,
-    IdentityBackend, IdentityState, UnlockIdentity, X25519AgeIdentity, X25519KeyAgreement,
+    DeviceIdentity, DiscoveredIdentity, IdentityBackend, IdentityOperation, IdentitySession,
+    IdentityState,
 };
 
-pub const DEFAULT_SLOT: u8 = 0x82;
+pub const ENCRYPTION_SLOT: u8 = 0x82;
+pub const SIGNING_SLOT: u8 = 0x83;
 
 const PIV_AID: &[u8] = &[0xA0, 0x00, 0x00, 0x03, 0x08];
+const ALG_ED25519: u8 = 0xE0;
 const ALG_X25519: u8 = 0xE1;
 const SLOT_MANAGEMENT: u8 = 0x9B;
 const PIN_REFERENCE: u8 = 0x80;
@@ -39,10 +45,14 @@ const TAG_GEN_ALGORITHM: u16 = 0x80;
 const TAG_PIN_POLICY: u16 = 0xAA;
 const TAG_TOUCH_POLICY: u16 = 0xAB;
 const TAG_METADATA_ALGORITHM: u16 = 0x01;
+const TAG_METADATA_POLICY: u16 = 0x02;
 const TAG_METADATA_PUBLIC_KEY: u16 = 0x04;
 
 const PIN_POLICY_ONCE: u8 = 0x02;
+const TOUCH_POLICY_NEVER: u8 = 0x01;
 const TOUCH_POLICY_ALWAYS: u8 = 0x02;
+const TOUCH_POLICY_CACHED: u8 = 0x03;
+const TOUCH_CACHE_WINDOW: Duration = Duration::from_secs(15);
 const DEFAULT_MANAGEMENT_KEY: &[u8; 24] = b"\x01\x02\x03\x04\x05\x06\x07\x08\x01\x02\x03\x04\x05\x06\x07\x08\x01\x02\x03\x04\x05\x06\x07\x08";
 
 #[derive(Debug)]
@@ -78,17 +88,29 @@ fn status_note(status: u16) -> &'static str {
 pub enum SlotInfo {
     Empty,
     X25519([u8; 32]),
+    Ed25519([u8; 32]),
     Other(u8),
     Unavailable(String),
 }
 
 impl SlotInfo {
-    pub fn description(&self) -> String {
+    pub fn description(&self, slot: u8) -> String {
         match self {
-            Self::Empty => "slot 82 empty".into(),
-            Self::X25519(_) => "slot 82 X25519".into(),
-            Self::Other(algorithm) => format!("slot 82 occupied by algorithm {algorithm:02X}"),
-            Self::Unavailable(error) => format!("slot 82 unavailable: {error}"),
+            Self::Empty => format!("slot {slot:02X} empty"),
+            Self::X25519(_) => format!("slot {slot:02X} X25519"),
+            Self::Ed25519(_) => format!("slot {slot:02X} Ed25519"),
+            Self::Other(algorithm) => {
+                format!("slot {slot:02X} occupied by algorithm {algorithm:02X}")
+            }
+            Self::Unavailable(error) => format!("slot {slot:02X} unavailable: {error}"),
+        }
+    }
+
+    fn public_key_for(&self, algorithm: u8) -> Option<[u8; 32]> {
+        match self {
+            Self::X25519(key) if algorithm == ALG_X25519 => Some(*key),
+            Self::Ed25519(key) if algorithm == ALG_ED25519 => Some(*key),
+            _ => None,
         }
     }
 }
@@ -96,7 +118,15 @@ impl SlotInfo {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeviceInfo {
     pub serial: u32,
-    pub slot: SlotInfo,
+    pub encryption_slot: SlotInfo,
+    pub signing_slot: SlotInfo,
+    pub signing_touch_policy: Option<u8>,
+}
+
+struct SlotMetadata {
+    algorithm: u8,
+    public_key: Vec<u8>,
+    touch_policy: Option<u8>,
 }
 
 pub struct YubiKey {
@@ -170,21 +200,23 @@ impl YubiKey {
             let Ok(candidate) = Self::from_card(card) else {
                 continue;
             };
-            let slot = match candidate.slot_metadata(DEFAULT_SLOT) {
-                Ok(None) => SlotInfo::Empty,
-                Ok(Some((ALG_X25519, public_key))) if public_key.len() == 32 => {
-                    SlotInfo::X25519(public_key.try_into().expect("length checked"))
-                }
-                Ok(Some((algorithm, _))) => SlotInfo::Other(algorithm),
-                Err(error) => SlotInfo::Unavailable(format!("{error:#}")),
-            };
+            let encryption_slot = candidate.inspect_slot(ENCRYPTION_SLOT, ALG_X25519);
+            let signing_metadata = candidate.slot_metadata(SIGNING_SLOT).ok().flatten();
+            let signing_touch_policy = signing_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.touch_policy);
+            let signing_slot = signing_metadata
+                .map(|metadata| slot_info(metadata, ALG_ED25519))
+                .unwrap_or_else(|| candidate.inspect_slot(SIGNING_SLOT, ALG_ED25519));
             if !devices
                 .iter()
                 .any(|device: &DeviceInfo| device.serial == candidate.serial)
             {
                 devices.push(DeviceInfo {
                     serial: candidate.serial,
-                    slot,
+                    encryption_slot,
+                    signing_slot,
+                    signing_touch_policy,
                 });
             }
         }
@@ -239,16 +271,17 @@ impl YubiKey {
             self.version[0], self.version[1], self.version[2]
         );
 
-        if let Some((algorithm, public_key)) = self.slot_metadata(slot)? {
+        if let Some(metadata) = self.slot_metadata(slot)? {
             ensure!(
-                algorithm == ALG_X25519,
-                "PIV slot {slot:02x} already contains algorithm {algorithm:02x}; nit will not overwrite it"
+                metadata.algorithm == ALG_X25519,
+                "PIV slot {slot:02x} already contains algorithm {:02x}; git-vault will not overwrite it",
+                metadata.algorithm
             );
             ensure!(
-                public_key.len() == 32,
+                metadata.public_key.len() == 32,
                 "slot {slot:02x} has an invalid X25519 public key"
             );
-            return Ok(public_key.try_into().expect("length checked"));
+            return Ok(metadata.public_key.try_into().expect("length checked"));
         }
 
         eprintln!("PIV slot {slot:02x} is empty and will receive a new X25519 key.");
@@ -264,7 +297,66 @@ impl YubiKey {
         input.zeroize();
         let management_algorithm = self.management_key_algorithm()?;
         self.authenticate_management_key(management_algorithm, &management_key)?;
-        self.generate_x25519(slot)
+        self.generate_curve25519(slot, ALG_X25519, TOUCH_POLICY_ALWAYS)
+    }
+
+    pub fn ensure_ed25519_key(&mut self, slot: u8) -> Result<[u8; 32]> {
+        ensure!(
+            self.version >= [5, 7, 0],
+            "YubiKey firmware {}.{}.{} does not support PIV Ed25519; version 5.7 or newer is required",
+            self.version[0],
+            self.version[1],
+            self.version[2]
+        );
+
+        if let Some(metadata) = self.slot_metadata(slot)? {
+            ensure!(
+                metadata.algorithm == ALG_ED25519,
+                "PIV slot {slot:02x} already contains algorithm {:02x}; git-vault will not overwrite it",
+                metadata.algorithm
+            );
+            ensure!(
+                metadata.public_key.len() == 32,
+                "slot {slot:02x} has an invalid Ed25519 public key"
+            );
+            return Ok(metadata.public_key.try_into().expect("length checked"));
+        }
+
+        eprintln!("PIV slot {slot:02x} is empty and will receive a new Ed25519 key.");
+        let mut input = rpassword::prompt_password(
+            "PIV management key (hex; Enter uses the factory default): ",
+        )
+        .context("failed to read PIV management key")?;
+        let management_key = if input.trim().is_empty() {
+            Zeroizing::new(DEFAULT_MANAGEMENT_KEY.to_vec())
+        } else {
+            Zeroizing::new(hex::decode(input.trim()).context("management key is not valid hex")?)
+        };
+        input.zeroize();
+        let management_algorithm = self.management_key_algorithm()?;
+        self.authenticate_management_key(management_algorithm, &management_key)?;
+        self.generate_curve25519(slot, ALG_ED25519, TOUCH_POLICY_CACHED)
+    }
+
+    pub fn sign(&mut self, slot: u8, message: &[u8; 32]) -> Result<[u8; 64]> {
+        let request = tlv(
+            TAG_DYN_AUTH,
+            &[
+                tlv(TAG_AUTH_RESPONSE, &[]),
+                tlv(TAG_AUTH_CHALLENGE, message),
+            ]
+            .concat(),
+        );
+        let response = self.command(0, INS_AUTHENTICATE, ALG_ED25519, slot, &request)?;
+        let dynamic =
+            find_tlv(&response, TAG_DYN_AUTH).context("YubiKey signing response lacks tag 7C")?;
+        let signature = find_tlv(dynamic, TAG_AUTH_RESPONSE)
+            .context("YubiKey signing response lacks tag 82")?;
+        ensure!(
+            signature.len() == 64,
+            "YubiKey returned an invalid Ed25519 signature"
+        );
+        Ok(signature.try_into().expect("length checked"))
     }
 
     pub fn agree(&mut self, slot: u8, peer_public_key: &[u8; 32]) -> Result<[u8; 32]> {
@@ -289,7 +381,15 @@ impl YubiKey {
         Ok(secret.try_into().expect("length checked"))
     }
 
-    fn slot_metadata(&self, slot: u8) -> Result<Option<(u8, Vec<u8>)>> {
+    fn inspect_slot(&self, slot: u8, expected_algorithm: u8) -> SlotInfo {
+        match self.slot_metadata(slot) {
+            Ok(None) => SlotInfo::Empty,
+            Ok(Some(metadata)) => slot_info(metadata, expected_algorithm),
+            Err(error) => SlotInfo::Unavailable(format!("{error:#}")),
+        }
+    }
+
+    fn slot_metadata(&self, slot: u8) -> Result<Option<SlotMetadata>> {
         let (response, status) = self.command_raw(0, INS_GET_METADATA, 0, slot, &[])?;
         if status == 0x6A88 {
             return Ok(None);
@@ -303,7 +403,14 @@ impl YubiKey {
         let encoded_public_key = find_tlv(&response, TAG_METADATA_PUBLIC_KEY)
             .context("slot metadata lacks a public key")?;
         let public_key = parse_device_public_key(encoded_public_key)?.to_vec();
-        Ok(Some((algorithm, public_key)))
+        let touch_policy = find_tlv(&response, TAG_METADATA_POLICY)
+            .and_then(|policy| policy.get(1))
+            .copied();
+        Ok(Some(SlotMetadata {
+            algorithm,
+            public_key,
+            touch_policy,
+        }))
     }
 
     fn management_key_algorithm(&self) -> Result<u8> {
@@ -365,11 +472,15 @@ impl YubiKey {
         Ok(())
     }
 
-    fn generate_x25519(&self, slot: u8) -> Result<[u8; 32]> {
+    fn generate_curve25519(&self, slot: u8, algorithm: u8, touch_policy: u8) -> Result<[u8; 32]> {
+        ensure!(
+            matches!(algorithm, ALG_X25519 | ALG_ED25519),
+            "unsupported Curve25519 algorithm"
+        );
         let parameters = [
-            tlv(TAG_GEN_ALGORITHM, &[ALG_X25519]),
+            tlv(TAG_GEN_ALGORITHM, &[algorithm]),
             tlv(TAG_PIN_POLICY, &[PIN_POLICY_ONCE]),
-            tlv(TAG_TOUCH_POLICY, &[TOUCH_POLICY_ALWAYS]),
+            tlv(TAG_TOUCH_POLICY, &[touch_policy]),
         ]
         .concat();
         let request = tlv(0xAC, &parameters);
@@ -380,7 +491,7 @@ impl YubiKey {
             .context("key-generation response lacks public key tag 86")?;
         ensure!(
             public_key.len() == 32,
-            "YubiKey returned an invalid X25519 public key"
+            "YubiKey returned an invalid Curve25519 public key"
         );
         Ok(public_key.try_into().expect("length checked"))
     }
@@ -432,76 +543,88 @@ impl IdentityBackend for YubiKeyBackend {
     }
 
     fn discover(&self) -> Result<Vec<DiscoveredIdentity>> {
-        YubiKey::list_devices()?
+        Ok(YubiKey::list_devices()?
             .into_iter()
             .map(|device| {
-                let state = match &device.slot {
-                    SlotInfo::Empty => IdentityState::Provisionable,
-                    SlotInfo::X25519(public_key) => IdentityState::Ready {
-                        age_recipient: encode_age_recipient(public_key)?,
-                    },
-                    SlotInfo::Other(algorithm) => IdentityState::Unavailable(format!(
-                        "slot {DEFAULT_SLOT:02X} contains algorithm {algorithm:02X}"
+                let encryption_public_key = device.encryption_slot.public_key_for(ALG_X25519);
+                let signing_public_key = device.signing_slot.public_key_for(ALG_ED25519);
+                let state = match (encryption_public_key, signing_public_key) {
+                    (Some(encryption_public_key), Some(signing_public_key)) => {
+                        IdentityState::Ready(DeviceIdentity {
+                            backend: self.id().into(),
+                            locator: device.serial.to_string(),
+                            display_name: format!("YubiKey {}", device.serial),
+                            encryption_public_key,
+                            signing_public_key,
+                            certificate: Vec::new(),
+                        })
+                    }
+                    _ if matches!(
+                        device.encryption_slot,
+                        SlotInfo::Empty | SlotInfo::X25519(_)
+                    ) && matches!(
+                        device.signing_slot,
+                        SlotInfo::Empty | SlotInfo::Ed25519(_)
+                    ) =>
+                    {
+                        IdentityState::Provisionable
+                    }
+                    _ => IdentityState::Unavailable(format!(
+                        "{}; {}",
+                        device.encryption_slot.description(ENCRYPTION_SLOT),
+                        device.signing_slot.description(SIGNING_SLOT)
                     )),
-                    SlotInfo::Unavailable(error) => IdentityState::Unavailable(error.clone()),
                 };
-                Ok(DiscoveredIdentity {
+                DiscoveredIdentity {
                     backend: self.id().into(),
                     locator: device.serial.to_string(),
                     display_name: format!("YubiKey {}", device.serial),
-                    detail: device.slot.description(),
+                    detail: format!(
+                        "{}; {}; signing touch {}",
+                        device.encryption_slot.description(ENCRYPTION_SLOT),
+                        device.signing_slot.description(SIGNING_SLOT),
+                        touch_policy_description(device.signing_touch_policy)
+                    ),
                     state,
-                })
+                }
             })
-            .collect()
+            .collect())
     }
 
-    fn matches(&self, identity: &DiscoveredIdentity, recipient: &AuthorizedRecipient) -> bool {
-        identity.backend == self.id()
-            && recipient.backend == self.id()
-            && identity.locator == recipient.locator
-            && matches!(
-                &identity.state,
-                IdentityState::Ready { age_recipient }
-                    if age_recipient == &recipient.age_recipient
-            )
-    }
-
-    fn provision(
-        &self,
-        identity: &DiscoveredIdentity,
-        friendly_name: String,
-    ) -> Result<AuthorizedRecipient> {
+    fn provision(&self, identity: &DiscoveredIdentity) -> Result<DeviceIdentity> {
         ensure!(identity.backend == self.id(), "wrong identity backend");
         ensure!(
-            identity.state.is_provisionable(),
+            identity.state.is_usable(),
             "{} cannot be provisioned: {}",
             identity.display_name,
             identity.state.description()
         );
+        if let IdentityState::Ready(device) = &identity.state {
+            return Ok(device.clone());
+        }
         let serial = parse_locator(&identity.locator)?;
         let mut key = YubiKey::open(Some(serial))?;
-        let public_key = key.ensure_x25519_key(DEFAULT_SLOT)?;
-        Ok(AuthorizedRecipient {
-            name: friendly_name,
+        let encryption_public_key = key.ensure_x25519_key(ENCRYPTION_SLOT)?;
+        let signing_public_key = key.ensure_ed25519_key(SIGNING_SLOT)?;
+        Ok(DeviceIdentity {
             backend: self.id().into(),
             locator: identity.locator.clone(),
-            age_recipient: encode_age_recipient(&public_key)?,
+            display_name: identity.display_name.clone(),
+            encryption_public_key,
+            signing_public_key,
+            certificate: Vec::new(),
         })
     }
 
-    fn unlock(
-        &self,
-        identity: &DiscoveredIdentity,
-        recipient: &AuthorizedRecipient,
-        stanza_index: usize,
-    ) -> Result<Box<dyn UnlockIdentity>> {
-        ensure!(
-            self.matches(identity, recipient),
-            "identity does not match recipient"
-        );
+    fn open(&self, identity: &DiscoveredIdentity) -> Result<Box<dyn IdentitySession>> {
+        let IdentityState::Ready(device) = &identity.state else {
+            bail!("{} is not provisioned", identity.display_name);
+        };
         let serial = parse_locator(&identity.locator)?;
         let mut key = YubiKey::open(Some(serial))?;
+        let signing_touch_policy = key
+            .slot_metadata(SIGNING_SLOT)?
+            .and_then(|metadata| metadata.touch_policy);
         let pin = Zeroizing::new(
             rpassword::prompt_password("PIV PIN: ").context("failed to read PIV PIN")?,
         );
@@ -510,30 +633,78 @@ impl IdentityBackend for YubiKeyBackend {
             "an empty PIV PIN was not sent to the YubiKey"
         );
         key.verify_pin(&pin)?;
-        let public_key = decode_age_recipient(&recipient.age_recipient)?;
-        Ok(Box::new(X25519AgeIdentity::new(
-            Box::new(YubiKeyAgreement {
-                key,
-                slot: DEFAULT_SLOT,
-            }),
-            public_key,
-            stanza_index,
-        )))
+        Ok(Box::new(YubiKeySession {
+            key,
+            identity: device.clone(),
+            signing_touch_policy,
+            last_sign: None,
+        }))
     }
 }
 
-struct YubiKeyAgreement {
+struct YubiKeySession {
     key: YubiKey,
-    slot: u8,
+    identity: DeviceIdentity,
+    signing_touch_policy: Option<u8>,
+    last_sign: Option<Instant>,
 }
 
-impl X25519KeyAgreement for YubiKeyAgreement {
-    fn agree(&mut self, peer_public_key: &[u8; 32]) -> Result<[u8; 32]> {
-        self.key.agree(self.slot, peer_public_key)
+impl IdentitySession for YubiKeySession {
+    fn identity(&self) -> &DeviceIdentity {
+        &self.identity
     }
 
-    fn prompt(&self) -> &str {
-        "Touch the YubiKey to unlock the vault…"
+    fn sign(&mut self, message: &[u8; 32]) -> Result<[u8; 64]> {
+        let signature = self
+            .key
+            .sign(SIGNING_SLOT, message)
+            .context("YubiKey did not authorize signing; touch when prompted, or quit and reopen to reverify the PIN")?;
+        self.last_sign = Some(Instant::now());
+        Ok(signature)
+    }
+
+    fn agree(&mut self, peer_public_key: &[u8; 32]) -> Result<[u8; 32]> {
+        self.key.agree(ENCRYPTION_SLOT, peer_public_key).context(
+            "YubiKey did not authorize key agreement; touch when prompted, or retry to reverify the PIN",
+        )
+    }
+
+    fn interaction_hint(&self, operation: IdentityOperation) -> Option<&'static str> {
+        match operation {
+            IdentityOperation::Sign
+                if self.signing_touch_policy == Some(TOUCH_POLICY_NEVER)
+                    || self.signing_touch_policy == Some(TOUCH_POLICY_CACHED)
+                        && self
+                            .last_sign
+                            .is_some_and(|last| last.elapsed() < TOUCH_CACHE_WINDOW) =>
+            {
+                None
+            }
+            IdentityOperation::Sign => Some("Touch the YubiKey to sign the vault event…"),
+            IdentityOperation::Agree => Some("Touch the YubiKey to unlock the membership epoch…"),
+        }
+    }
+}
+
+fn touch_policy_description(policy: Option<u8>) -> &'static str {
+    match policy {
+        Some(TOUCH_POLICY_NEVER) => "never",
+        Some(TOUCH_POLICY_ALWAYS) => "always",
+        Some(TOUCH_POLICY_CACHED) => "cached",
+        Some(_) => "unknown",
+        None => "not reported",
+    }
+}
+
+fn slot_info(metadata: SlotMetadata, expected_algorithm: u8) -> SlotInfo {
+    if metadata.public_key.len() != 32 {
+        return SlotInfo::Other(metadata.algorithm);
+    }
+    let key: [u8; 32] = metadata.public_key.try_into().expect("length checked");
+    match metadata.algorithm {
+        ALG_X25519 if expected_algorithm == ALG_X25519 => SlotInfo::X25519(key),
+        ALG_ED25519 if expected_algorithm == ALG_ED25519 => SlotInfo::Ed25519(key),
+        _ => SlotInfo::Other(metadata.algorithm),
     }
 }
 

@@ -1,280 +1,291 @@
-# nit
+# git-vault
 
-`nit` is a tiny, single-executable secret vault backed by YubiKey 5. A vault is opened with one command:
+`git-vault` is an append-only, Git-native, hardware-backed secret vault. When installed as `git-vault`, Git discovers it as a subcommand:
 
-```text
-nit [options] <file> [command]
+```sh
+git vault prod
 ```
 
-With no command, the terminal interface manages secrets, recipients, invitation slots, and access requests. Explicit subcommands provide stable automation without replaying UI keystrokes.
+The interactive TUI derives a verified trusted projection, unlocks the current membership epoch with a YubiKey, and provides the familiar secret workflow:
 
-> **Alpha security software:** `nit` uses standard age encryption and has unit tests, but it has not received an independent security audit. Do not make it the only copy of irreplaceable credentials yet.
+```text
+<j>/<k> select  <n> new  <e> edit  <d> delete
+<r> reveal      <y> output  <a> access  <q> quit
+```
 
-## Requirements
+Successful secret edits immediately append immutable, signed events.
 
-- YubiKey 5 firmware 5.7.0 or newer with PIV enabled.
-- A non-FIPS model: Yubico does not allow X25519 in the PIV application on FIPS 140-3 capable devices.
-- The smart-card/CCID support included with the operating system. On Linux, this normally means `pcscd`; macOS and Windows provide a system smart-card service.
+> **Early security prototype:** the event log, trusted replay, epoch encryption, Git plumbing, fork detection, Ed25519/X25519 hardware identities, and audited OPAQUE onboarding are implemented and tested. X.509 identity envelopes and persistent YubiKey membership checkpoints remain incomplete. Do not use this as the only copy of important secrets.
 
-Yubico documents X25519 as PIV algorithm `E1` and its firmware/model restrictions in the [YubiKey Technical Manual](https://docs.yubico.com/hardware/yubikey/yk-tech-manual/webdocs.pdf).
+## Storage model
 
-## Development workflow
+A vault is stored only through Git objects and a custom ref:
 
-### Mise
+```text
+refs/vaults/prod
+```
 
-The repository pins Rust 1.87 in `mise.toml`. Bootstrap once, then use Make:
+The ref points to a commit whose `vault.log` blob is a bounded, canonical, append-only binary event stream. It is not a worktree file. `git-vault` does not create `.nit` files and does not write arbitrary mutable files under `.git`.
+
+Additional refs are isolated by purpose:
+
+```text
+refs/vault-remotes/<remote>/<vault>   fetched, untrusted remote state
+refs/vault-local/<vault>              local freshness checkpoint object
+refs/vault-onboarding/<vault>/<event> requester-only OPAQUE continuation state
+```
+
+Git stores, synchronizes, and retains history. Git commits, authors, timestamps, and ancestry do not decide event authorization.
+
+## Trust model
+
+Anyone who can write Git objects may append candidate events. Every client independently computes the trusted projection:
+
+```text
+raw event log
+    -> bounded canonical parsing
+    -> Ed25519 signature verification
+    -> parent_trust_hash matching
+    -> authorization under the previously trusted membership
+    -> derived trusted state
+```
+
+The code uses three distinct validation levels:
+
+- **Structurally valid:** canonical fields and lengths are valid and the Ed25519 signature verifies.
+- **Invitation-authenticated proposal:** a proposal has additionally completed the audited OPAQUE exchange and explicit key confirmation.
+- **Trusted event:** the event extends the current trust hash and its signer was authorized for that event type by the previous trusted state.
+
+Structurally valid but unauthorized events remain inert. A removed member can continue appending mathematically valid signatures, but those events cannot extend the trusted state.
+
+Every trusted child binds the logical state it intends to extend:
+
+```text
+Hnext = SHA256("git-vault/trust/v1" || Hcurrent || event_hash)
+```
+
+If multiple authorized children target the same trusted hash, replay stops and reports a fork. V1 does not silently select or merge one branch.
+
+## Membership epochs
+
+The current membership epoch contains:
+
+- trusted member names, roles, Ed25519 keys, and X25519 keys;
+- one random epoch key wrapped independently to each member;
+- an authenticated encrypted snapshot of current typed values.
+
+Ordinary `Put` and `Delete` events use the current epoch key. They do not re-encrypt the whole vault.
+
+A membership transition creates a fresh epoch key and a fresh encrypted snapshot. A new member can decrypt the current logical state without receiving old epoch keys. A removed member receives no new key. Historical access cannot be revoked.
+
+Current roles are intentionally minimal:
+
+```text
+reader
+owner
+```
+
+V1 currently permits only owners to append trusted state changes.
+
+## Hardware identity
+
+Each provisioned YubiKey uses a permanent public-key pair:
+
+```text
+PIV slot 82   X25519 encryption/key agreement
+PIV slot 83   Ed25519 event signing
+```
+
+Private keys remain on the device. PIN verification happens once per application session. X25519 unlock requires touch; newly provisioned Ed25519 signing keys use YubiKey's cached-touch policy so a burst of event appends does not require a touch for every event. Application code uses generic identity traits so software identities can exercise the security-critical replay and crypto code in tests.
+
+The stable member identity is the Ed25519/X25519 public-key pair—not a serial number, Git identity, or certificate fingerprint. YubiKey serials are only local backend locators.
+
+A future PIV-native self-signed X.509 envelope may bind the two public keys and protocol metadata. It will not become a vault CA, revocation system, OCSP hierarchy, or general PKI.
+
+## Usage
+
+Run inside a Git working tree. Creating a missing vault provisions/selects an identity and writes `refs/vaults/<name>`:
+
+```sh
+git vault prod
+```
+
+With multiple identities:
+
+```sh
+git vault prod --identity yubikey:33127878
+```
+
+Stable commands are available for automation:
+
+```sh
+git vault prod list
+git vault prod get TOKEN
+printf '%s' "$TOKEN" | git vault prod set TOKEN --stdin
+git vault prod set PORT --type number
+git vault prod set ENABLED --type boolean
+git vault prod set KEY_BYTES --type bytes
+git vault prod delete TOKEN
+git vault prod members
+git vault prod invite --minutes 30 --words 4
+git vault prod request-access <invitation> --name Bob
+git vault prod respond <proposal-start>
+git vault prod continue-request <proposal-start>
+git vault prod approve <final-proposal>
+git vault prod confirm-access <final-proposal>
+git vault prod remove-member <name-or-fingerprint>
+git vault prod set-role <name-or-fingerprint> reader
+git vault prod verify
+```
+
+Typed values currently support:
+
+```text
+text
+number
+boolean
+bytes       hexadecimal command input/output
+```
+
+Secret prompts use the controlling terminal. `--stdin` is an explicit pipeline opt-in.
+
+## Synchronization
+
+Custom refs are not included by ordinary branch fetch/push defaults. Use:
+
+```sh
+git vault prod push origin
+git vault prod fetch origin
+```
+
+Push never forces the remote vault ref. Fetch first writes only to:
+
+```text
+refs/vault-remotes/origin/prod
+```
+
+The fetched log is parsed, signatures and authorization are replayed, forks and local rollback are checked, and only then is `refs/vaults/prod` advanced with a compare-and-swap ref update.
+
+Never configure `refs/vault-local/*` or `refs/vault-onboarding/*` for pushing. They contain local freshness and requester continuation state, respectively.
+
+## Invitations and membership management
+
+The binary event model includes immutable `CreateInvitation`, `InvitationResponse`, `CloseInvitation`, and staged `ProposeUser` records. `git-vault` uses `opaque-ke` 3.0 with Ristretto255, TripleDH, and Argon2. The implementation lineage was independently audited by NCC Group; the older unaudited SPAKE2 crate was not selected. The review is recorded in [`docs/pake-review.md`](docs/pake-review.md).
+
+The asynchronous exchange is:
+
+1. An owner appends a trusted invitation containing an OPAQUE password file and an epoch-encrypted server setup.
+2. The requester appends a signed, inert OPAQUE credential request and retains continuation state only under `refs/vault-onboarding/*`.
+3. An owner appends a trusted OPAQUE server response with epoch-encrypted server state.
+4. The requester appends the OPAQUE finalization. The owner verifies key confirmation before approval.
+5. The owner appends a membership epoch referencing the exact final proposal.
+6. The requester verifies an admission confirmation bound to the exact epoch before accepting/checkpointing membership.
+
+When participants use different clones, they run `git vault <name> push`/`fetch` between these append steps. The PAKE protocol itself is transport-independent. In interactive mode, selecting an untrusted or provisionable YubiKey starts or resumes this invitation workflow instead of attempting to unlock the vault as a trusted member.
+
+OPAQUE context and admission confirmation bind:
+
+```text
+vault ID
+invitation ID
+proposed Ed25519/X25519 identity
+new membership epoch
+trusted membership hash
+```
+
+A proposal remains inert until an existing owner signs the membership epoch that references that exact immutable final proposal. Wrong phrases and repository parameter substitution fail OPAQUE confirmation without creating a public offline phrase verifier.
+
+## Rollback anchors
+
+Two independent mechanisms are designed:
+
+- `refs/vault-local/<vault>` detects ordinary trusted-state rollback on a machine that has previously accepted a newer state.
+- A YubiKey trust record will anchor the newest accepted membership epoch outside rollbackable Git.
+
+The local freshness ref is implemented. The generic hardware checkpoint interface and replay validation are implemented; persistent YubiKey checkpoint storage is not yet implemented, and vault creation reports that limitation explicitly. PIV object constraints and the required prototype are documented in [`docs/yubikey-checkpoint-feasibility.md`](docs/yubikey-checkpoint-feasibility.md).
+
+A fresh clone has neither checkpoint. It can verify signatures and authorization from Genesis but cannot independently know whether the repository omitted a newer valid suffix. This limitation is fundamental and documented rather than hidden.
+
+## Binary format and limits
+
+The current prototype format uses `GVLOG002`/`GVEVT002`. The explicit binary codec is versioned, length-delimited, canonical, and independently frames each event. Prototype formats are not migrated or accepted as legacy input.
+
+```text
+log magic
+event length
+event magic + version
+vault ID + event ID + type
+parent trust hash + author signing key
+bounded canonical payload
+Ed25519 signature
+```
+
+Unknown event types are structurally parseable but inert. Trailing fields, truncation, duplicate event IDs, malformed keys, invalid signatures, and oversized records are rejected or diagnosed without granting trust.
+
+Hard limits include:
+
+- 64 MiB complete log;
+- 20 MiB event;
+- 16 MiB value/snapshot;
+- 64 members;
+- 32 active invitations;
+- 128 pending proposals;
+- bounded names, keys, PAKE messages, and certificates.
+
+A writer can still cause storage or download denial of service. Cryptography makes unauthorized data inert, not free.
+
+## Development
+
+Rust 1.87 is pinned in `mise.toml`.
 
 ```sh
 make setup
 make check
-```
-
-The normal edit/test loop is:
-
-```sh
-make fmt
-make check
-make run ARGS='--help'
-make run ARGS='path/to/secrets.nit'
-```
-
-`make build` creates `target/debug/nit`. `make check` runs the formatting check, unit tests, and Clippy with warnings denied. Run `make help` for every target.
-
-If Rust is already managed without Mise, the Makefile uses the `cargo` and `rustc` on `PATH`. They can also be overridden explicitly:
-
-```sh
-make check CARGO=/path/to/cargo RUSTC=/path/to/rustc
-```
-
-### Nix
-
-The flake supplies Rust 1.87, `pkg-config`, and PC/SC development libraries on Linux:
-
-```sh
-nix develop       # enter the development shell
-nix build         # build ./result/bin/nit
-nix run . -- --help
-nix flake check   # build and run package tests
-```
-
-The host smart-card service still needs to be running when nit accesses a YubiKey.
-
-### Release builds and archives
-
-```sh
-make release       # build target/release/nit
-make dist          # build dist/nit-<version>-<host>.tar.gz
-make ci            # run all checks and create the dist tarball
-```
-
-`make dist` packages the optimized executable with `README.md` and `LICENSE`, then prints its path. The resulting executable is host-specific and still uses the operating system PC/SC interface.
-
-For a project release:
-
-1. Update `version` in `Cargo.toml` and refresh `Cargo.lock` with `cargo check`.
-2. Run `make ci` and exercise the physical YubiKey unlock/request flow.
-3. Commit, create a signed `v<version>` Git tag, and push it.
-4. Run `make dist` and attach the archive to the GitHub release.
-
-The crate has `publish = false`; releases are executable archives rather than crates.io publications.
-
-### Install
-
-Install for the current user without privilege escalation:
-
-```sh
+make run ARGS='prod --help'
+make release
 make install-user
-# installs $HOME/.local/bin/nit
+
+# Optional parser fuzzing (requires cargo-fuzz)
+cargo fuzz run event_log
 ```
 
-Install system-wide:
-
-```sh
-sudo make install
-# installs /usr/local/bin/nit
-```
-
-Packaging systems can stage an installation without privilege escalation:
-
-```sh
-make install DESTDIR="$pkgdir" PREFIX=/usr
-```
-
-All Rust dependencies, including age, are compiled into the executable. Users do not install the `age` command, `ykman`, OpenSSL, a YubiKey plugin, or a language runtime. The operating system smart-card interface is the sole runtime boundary.
-
-## First use
-
-Insert one YubiKey and run:
-
-```sh
-nit secrets.nit
-```
-
-For retired PIV slot `82`, nit will:
-
-- Reuse an existing X25519 key.
-- Refuse to overwrite any other key type.
-- Otherwise ask for the PIV management key and generate an X25519 key with PIN policy `once` and touch policy `always`.
-
-Press Enter at the management-key prompt to use Yubico's factory management key. A custom management key is entered as hexadecimal. The private key never leaves the YubiKey.
-
-A generated PIV key cannot be exported or backed up. Open an invitation and authorize at least one additional YubiKey if the vault needs recovery.
-
-### Identity backends and multiple devices
-
-Nit's vault, crypto, UI, and command layer operate on backend-neutral identity records. The current `yubikey` backend inspects the serial number, slot type, and X25519 public key before asking for a PIN or touch:
-
-- One eligible identity is selected automatically.
-- Multiple usable identities always open an interactive `j`/`k` selector, including when only one is currently authorized for the vault.
-- When opening an existing vault, the selector marks each identity as authorized or not authorized.
-- Creating a vault or requesting access shows only identities that are ready or can be provisioned.
-- A YubiKey with a non-X25519 slot 82 is displayed as unavailable and is never overwritten.
-
-For commands, or to bypass the selector, use the stable `backend:locator` identity selector:
-
-```sh
-nit --identity yubikey:33127878 secrets.nit
-nit --identity yubikey:33127878 secrets.nit list
-```
-
-Commands require `--identity` when multiple eligible identities are discovered so automation remains deterministic.
-
-`src/identity.rs` defines backend-neutral discovery, provisioning, matching, and unlock traits plus the generic authorized-recipient record. Implementations live under `src/backends/`; PIV/APDU details are isolated in `src/backends/yubikey.rs`. A future macOS backend can use LocalAuthentication and a Keychain access-control policy to gate an age identity with Touch ID. Touch ID is an authorization mechanism rather than an age key itself, and no YubiKey fields need to leak into the vault format or application logic.
-
-## Secret keys
-
-| Key | Action |
-|---|---|
-| `j` / Down | Select next secret |
-| `k` / Up | Select previous secret |
-| `n` | Create a secret |
-| `e` | Replace the selected value |
-| `d` | Delete the selected secret after confirmation |
-| `r` | Reveal or hide the selected value |
-| `y` | Queue the selected value for stdout after exit |
-| `a` | Manage recipients, invitations, and requests |
-| `q` | Quit |
-| Esc | Cancel the current prompt; quit from the list |
-
-Every successful change is encrypted and atomically saved immediately.
-
-## Access keys
-
-Press `a` from the secret list.
-
-| Key | Action |
-|---|---|
-| `j` / Down | Select next access record |
-| `k` / Up | Select previous access record |
-| `n` | Open an invitation slot |
-| `e` | Rename the selected recipient |
-| `d` | Remove the selected recipient after confirmation |
-| `a` | Approve the selected request |
-| `x` | Reject and remove the selected request |
-| `c` | Close the selected invitation |
-| Esc / `q` | Return to secrets |
-
-Recipient names are encrypted, authenticated display metadata. Authorization always uses the canonical X25519 public key and displayed fingerprint, never the friendly name. Nit refuses to remove the final recipient. Removing any other recipient affects newly saved versions only; that key can still decrypt historical versions it already obtained from Git.
-
-## Invitation slots
-
-An authorized user opens a slot with `a`, then `n`. Nit asks for:
-
-- A lifetime in minutes; the default is 30 and the maximum is seven days.
-- A phrase length from four to six words; the default is four.
-
-Words are selected uniformly with the operating-system CSPRNG from the 2048-word BIP-39 English list. They are not wallet mnemonics. Approximate entropy is 44, 55, or 66 bits. Four words plus the memory-hard KDF are the minimum accepted security level.
-
-The requester types the complete phrase on **one line**, with a space between each word, and presses Enter only after the final word. For example, if the owner shares:
+`make install-user` installs:
 
 ```text
-canvas oxygen trophy
+~/.local/bin/git-vault
 ```
 
-the requester enters exactly `canvas oxygen trophy`, without quotes, commas, an invitation ID, or Enter between words. ASCII hyphens are also accepted in place of spaces.
+Ensure that directory is on `PATH` so `git vault` can discover it.
 
-Each slot is one-use and permits three approval attempts. The phrase authenticates a request only: it never decrypts the vault.
-
-### Git request lifecycle
-
-1. An owner opens an invitation, commits the changed `.nit` file, and pushes it.
-2. The owner shares the invitation phrase verbally.
-3. The anticipated recipient pulls, opens the same `.nit` file, and selects the invitation.
-4. They type all invitation words on one line separated by spaces, press Enter once, and then enter a friendly identity name.
-5. Nit adds an encrypted request to that same `.nit` file without changing the encrypted vault payload.
-6. The requester commits and pushes the file.
-7. An owner pulls, unlocks the vault, and reviews the pending request.
-8. Approval adds the new identity, consumes the invitation, reseals the vault to every recipient, and removes the request.
-9. The owner commits and pushes; the new recipient pulls and can unlock.
-
-Nit does not execute Git. Repository operations remain explicit.
-
-Expiration is checked against the local clock whenever anyone opens the file. Unauthenticated users cannot submit against an expired slot. When an owner unlocks the vault, nit automatically closes expired invitations, removes their pending requests, reseals the authenticated payload, and atomically saves the cleanup. Git commit timestamps are not trusted proof that a request was made before expiration.
-
-### Invitation tamper resistance
-
-Each invitation derives independent binding and request keys with Argon2id using 64 MiB of memory, three passes, and a salt bound to the vault and invitation IDs. A public HMAC binds the vault ID, invitation ID, expiration, and request-inbox recipient.
-
-Before touching the requester's YubiKey, nit derives the phrase keys and verifies that binding in constant time. A repository writer who substitutes an inbox key or edits invitation metadata gets only a generic “incorrect phrase or tampered repository copy” failure. Owners also compare the public invitation records against the authenticated records after decrypting the vault.
-
-The public binding is necessarily an offline verifier, which is why nit now requires at least four random words and a memory-hard KDF. A request is additionally age-encrypted to the inbox and HMAC-bound to its vault, invitation, recipient, name, and nonce. Every failed owner approval consumes an attempt.
-
-A malicious writer can still delete requests, replay an old unexpired file, or create denial-of-service conflicts. Git review, branch protection, and expiry remain part of the security boundary.
-
-When a recipient is removed, nit rotates the inbox key and closes every invitation and pending request. This prevents former recipients who retained an old inbox key from reading future requests.
-
-## Command automation
-
-Automation uses explicit commands rather than replaying TUI keystrokes:
+Nix users can use:
 
 ```sh
-nit secrets.nit list
-nit secrets.nit get GITHUB_TOKEN
-printf '%s' "$TOKEN" | nit secrets.nit set GITHUB_TOKEN --stdin
-nit secrets.nit delete GITHUB_TOKEN
-
-nit secrets.nit invite --minutes 30 --words 4
-nit secrets.nit invitations
-nit secrets.nit recipients
-nit secrets.nit requests
-nit secrets.nit approve <request-id-prefix>
-nit secrets.nit reject <request-id-prefix>
+nix develop
+nix build
+nix run . -- prod --help
+nix flake check
 ```
 
-An unapproved recipient can submit a request without putting the phrase in process arguments:
+Linux builds require PC/SC development libraries, and runtime YubiKey access requires `pcscd`/CCID support. YubiKey firmware 5.7 or newer and a non-FIPS model are required for PIV Ed25519/X25519.
 
-```sh
-printf '%s\n' 'canvas oxygen trophy velvet' |
-  nit --identity yubikey:33127878 secrets.nit request-access <invitation-id> \
-    --name 'Alice — Work YubiKey' --phrase-stdin
+## Security-critical modules
+
+```text
+src/cli.rs                 stable Git-subcommand CLI
+src/git.rs                 isolated Git plumbing and CAS refs
+src/event.rs               canonical events and bounded stream parser
+src/state.rs               pure trusted replay, authorization, forks, rollback checks
+src/crypto.rs              epoch wrapping, snapshots, typed value AEAD
+src/identity.rs            backend-neutral hardware identity traits
+src/invitation.rs          audited OPAQUE onboarding and admission confirmation
+src/backends/yubikey.rs    PC/SC and PIV implementation
+src/backends/test_identity.rs software identity for deterministic tests
+src/runtime.rs             command orchestration and immediate event appends
+src/terminal.rs            terminal lifecycle and identity chooser
+src/tui.rs                 interaction over an in-memory trusted projection
+fuzz/fuzz_targets/event_log.rs bounded parser fuzz target
 ```
 
-Secret values and phrases default to secure controlling-terminal prompts. `--stdin` and `--phrase-stdin` are explicit opt-ins for pipelines. PIN and management-key prompts always use the controlling terminal.
+The core rule is:
 
-## Cryptographic design
-
-A file begins with `NITVLT03` and contains two trust domains:
-
-1. An age-encrypted payload containing secrets, approved recipients, friendly names, invitation keys, attempt counters, and the request-inbox private key.
-2. Strictly bounded public routing metadata, phrase-authenticated invitations, and age-encrypted access requests.
-
-The vault payload uses standard age X25519 recipient stanzas and age's authenticated streaming payload format. Each approved identity receives the age file key independently. Backends implement discovery, provisioning, recipient matching, and unlock. The YubiKey backend adapts PIV ECDH to the standard age X25519 identity operation; future biometric or platform-key backends can provide the same interface.
-
-The complete `.nit` container is not directly accepted by the age CLI because nit's public invitation and request records wrap the embedded age payload. The age format and primitives are used internally rather than through an external process.
-
-Secret values, decrypted payloads, invitation phrases and keys, PINs, management credentials, ECDH outputs, and file keys are zeroed where their owning Rust buffers permit. Operating systems, terminal emulators, allocators, and crash dumps can still copy process memory; zeroization is defense in depth.
-
-## Repository safety and limitations
-
-Encrypted `.nit` files are intended to be committed. Requests and public invitation metadata reveal no secret values, but they do reveal workflow activity and YubiKey routing metadata.
-
-- Removing a recipient cannot revoke old versions they already obtained from Git history.
-- Git rollback cannot be prevented by the vault alone. Signed commits, branch protection, and clients remembering newer generations can help detect it.
-- Concurrent modifications to the same binary `.nit` file can conflict and must be resolved by repeating the request against the latest version rather than byte-merging vault files.
-- Plaintext export is explicit through reveal or `y`; redirect it carefully.
-
-No plaintext temporary file is used by the built-in interface.
-
-## License
-
-MIT
+> Given the trusted state immediately before this event, was this signer authorized to make this exact change?
