@@ -619,7 +619,7 @@ impl OpenVault {
                     Ok((invitation_id, mut phrase)) => {
                         refresh_access_view(&mut app, &self.state);
                         app.set_status(format!(
-                            "Invitation {} phrase: {}",
+                            "Invitation {}: share this phrase with the requester: {}",
                             hex::encode_upper(&invitation_id[..4]),
                             phrase.as_str()
                         ));
@@ -644,9 +644,11 @@ impl OpenVault {
                     match self.respond_to_proposal(&selector) {
                         Ok(_) => {
                             refresh_access_view(&mut app, &self.state);
-                            app.set_status("OPAQUE response appended; requester must continue");
+                            app.set_status(
+                                "Challenge sent. Next: reopen with the requesting YubiKey to finish the phrase proof",
+                            );
                         }
-                        Err(error) => app.set_status(format!("Proposal not answered: {error:#}")),
+                        Err(error) => app.set_status(format!("Challenge not sent: {error:#}")),
                     }
                 }
                 Effect::ApproveProposal {
@@ -660,7 +662,7 @@ impl OpenVault {
                                 "Member admitted; epoch rotated; invitations invalidated",
                             );
                         }
-                        Err(error) => app.set_status(format!("Proposal not approved: {error:#}")),
+                        Err(error) => app.set_status(format!("Member not admitted: {error:#}")),
                     }
                 }
             }
@@ -829,7 +831,7 @@ fn run_interactive_existing(
             .find(|proposal| proposal.response_event_hash.is_some())
         {
             println!(
-                "Access proof {} is complete; an owner must approve it before this identity can open the vault.",
+                "Phrase proof {} is complete; an owner must admit this member before it can open the vault.",
                 hex::encode_upper(&final_proposal.event_hash[..8])
             );
             return Ok(());
@@ -850,7 +852,7 @@ fn run_interactive_existing(
         }
         if let Some(start) = matching.first() {
             println!(
-                "Access request {} is waiting for an owner response.",
+                "Join request {} is waiting for the owner to send a challenge.",
                 hex::encode_upper(&start.event_hash[..8])
             );
             return Ok(());
@@ -1084,7 +1086,7 @@ fn request_access(
     encoded.zeroize();
     println!("{}", hex::encode_upper(event_hash));
     eprintln!(
-        "Access proposal started; an owner must run `git vault {vault_name} respond {}`.",
+        "Join request started. Next: the owner must run `git vault {vault_name} respond {}` to send the PAKE challenge.",
         hex::encode_upper(&event_hash[..8])
     );
     Ok(())
@@ -1189,7 +1191,7 @@ fn continue_request(
     repository.delete_onboarding_state(vault_name, &proposal.event_hash)?;
     println!("{}", hex::encode_upper(final_hash));
     eprintln!(
-        "OPAQUE exchange complete; an owner must run `git vault {vault_name} approve {}`.",
+        "Invitation phrase proved. Next: the owner must run `git vault {vault_name} approve {}` to admit this member.",
         hex::encode_upper(&final_hash[..8])
     );
     Ok(())

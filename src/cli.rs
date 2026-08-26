@@ -49,7 +49,7 @@ pub enum Command {
     },
     /// Close an active invitation
     CloseInvitation { invitation: String },
-    /// Start an OPAQUE access proposal
+    /// Start a join request by proving knowledge of an invitation phrase
     RequestAccess {
         invitation: String,
         #[arg(long)]
@@ -57,15 +57,15 @@ pub enum Command {
         #[arg(long)]
         phrase_stdin: bool,
     },
-    /// Finish an OPAQUE proposal after an owner response
+    /// Finish the phrase proof after the owner sends its PAKE challenge
     ContinueRequest {
         proposal: String,
         #[arg(long)]
         phrase_stdin: bool,
     },
-    /// Append the owner response for an OPAQUE proposal start
+    /// Send the PAKE challenge for a new join request
     Respond { proposal: String },
-    /// Admit an invitation-authenticated final proposal as a reader
+    /// Admit a requester that completed the invitation phrase proof
     Approve { proposal: String },
     /// Verify admission confirmation and checkpoint the new member
     ConfirmAccess { proposal: String },

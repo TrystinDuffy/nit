@@ -172,14 +172,16 @@ Never configure `refs/vault-local/*` or `refs/vault-onboarding/*` for pushing. T
 
 The binary event model includes immutable `CreateInvitation`, `InvitationResponse`, `CloseInvitation`, and staged `ProposeUser` records. `git-vault` uses `opaque-ke` 3.0 with Ristretto255, TripleDH, and Argon2. The implementation lineage was independently audited by NCC Group; the older unaudited SPAKE2 crate was not selected. The review is recorded in [`docs/pake-review.md`](docs/pake-review.md).
 
-The asynchronous exchange is:
+The user-visible sequence is intentionally explicit because OPAQUE needs three PAKE messages plus admission:
 
-1. An owner appends a trusted invitation containing an OPAQUE password file and an epoch-encrypted server setup.
-2. The requester appends a signed, inert OPAQUE credential request and retains continuation state only under `refs/vault-onboarding/*`.
-3. An owner appends a trusted OPAQUE server response with epoch-encrypted server state.
-4. The requester appends the OPAQUE finalization. The owner verifies key confirmation before approval.
-5. The owner appends a membership epoch referencing the exact final proposal.
-6. The requester verifies an admission confirmation bound to the exact epoch before accepting/checkpointing membership.
+1. **Owner:** create an invitation and share its four-word phrase.
+2. **Requester:** select the invitation, enter the phrase, and start a join request.
+3. **Owner:** send the PAKE challenge for that join request.
+4. **Requester:** reopen with the requesting identity and enter the phrase again to finish the proof.
+5. **Owner:** admit the member after the proof is complete.
+6. **Requester:** verify the exact admission epoch before accepting/checkpointing membership.
+
+Internally these are an OPAQUE credential request, server response, credential finalization, owner-signed membership epoch, and admission confirmation. Requester continuation state lives only under `refs/vault-onboarding/*`.
 
 When participants use different clones, they run `git vault <name> push`/`fetch` between these append steps. The PAKE protocol itself is transport-independent. In interactive mode, selecting an untrusted or provisionable YubiKey starts or resumes this invitation workflow instead of attempting to unlock the vault as a trusted member.
 

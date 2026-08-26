@@ -75,7 +75,7 @@ impl VaultUi {
             values,
             members,
             invitations,
-            proposals,
+            proposals: visible_proposals(proposals),
             mode: Mode::Secrets,
             selected: 0,
             access_selected: 0,
@@ -220,7 +220,7 @@ impl VaultUi {
     ) {
         self.members = members;
         self.invitations = invitations;
-        self.proposals = proposals;
+        self.proposals = visible_proposals(proposals);
         self.access_selected = self
             .access_selected
             .min(self.access_count().saturating_sub(1));
@@ -320,7 +320,7 @@ impl VaultUi {
             InputKey::Char('a') => {
                 self.mode = Mode::Access;
                 self.revealed = None;
-                self.status = "Trusted projection: untrusted proposals are inert".into();
+                self.status = "Access changes stay inert until the owner admits them".into();
                 Effect::None
             }
             InputKey::Char('q') | InputKey::Esc => Effect::Quit,
@@ -369,11 +369,17 @@ impl VaultUi {
             }
             InputKey::Char('s') => {
                 let Some(proposal) = self.selected_proposal() else {
-                    self.status = "Select a proposal start to answer".into();
+                    self.status = "Select a new join request to send its challenge".into();
                     return Effect::None;
                 };
                 if proposal.response_event_hash.is_some() {
-                    self.status = "Select the initial proposal, not its finalization".into();
+                    self.status = "Phrase proof is complete; press <a> to admit this member".into();
+                    Effect::None
+                } else if proposal.owner_response_event_hash.is_some() {
+                    self.status = format!(
+                        "Challenge already sent; reopen with {}'s requesting key to finish the phrase proof",
+                        proposal.identity.name
+                    );
                     Effect::None
                 } else {
                     Effect::RespondProposal {
@@ -383,11 +389,11 @@ impl VaultUi {
             }
             InputKey::Char('a') => {
                 let Some(proposal) = self.selected_proposal() else {
-                    self.status = "Select a finalized proposal to approve".into();
+                    self.status = "Select a completed phrase proof to admit".into();
                     return Effect::None;
                 };
                 if proposal.response_event_hash.is_none() {
-                    self.status = "Requester has not finalized this proposal".into();
+                    self.status = "Phrase proof is not complete yet".into();
                     Effect::None
                 } else {
                     Effect::ApproveProposal {
@@ -435,6 +441,27 @@ impl VaultUi {
 
     fn access_count(&self) -> usize {
         self.members.len() + self.invitations.len() + self.proposals.len()
+    }
+
+    fn access_detail(&self) -> String {
+        if let Some(proposal) = self.selected_proposal() {
+            if proposal.response_event_hash.is_some() {
+                return "The requester proved the invitation phrase. Press <a> to admit this member."
+                    .into();
+            }
+            if proposal.owner_response_event_hash.is_some() {
+                return format!(
+                    "Challenge sent. Reopen with {}'s requesting YubiKey to finish the phrase proof.",
+                    proposal.identity.name
+                );
+            }
+            return "New join request. Press <s> to send the requester a PAKE challenge.".into();
+        }
+        if self.selected_invitation().is_some() {
+            return "Invitation is open. The requester selects it and enters its four-word phrase."
+                .into();
+        }
+        "Trusted members, active invitations, and join requests".into()
     }
 
     fn draw_secrets(
@@ -523,14 +550,14 @@ impl VaultUi {
         }
         for proposal in &self.proposals {
             let stage = if proposal.response_event_hash.is_some() {
-                "OPAQUE confirmed; awaiting approval"
+                "phrase proof complete — ready to admit"
             } else if proposal.owner_response_event_hash.is_some() {
-                "owner responded; awaiting requester"
+                "challenge sent — requester must finish"
             } else {
-                "awaiting owner response"
+                "new — owner must send challenge"
             };
             items.push(ListItem::new(format!(
-                "  pending proposal  {}  {}  {}  {:?}",
+                "  join request  {}  {}  {}  {:?}",
                 hex::encode_upper(&proposal.event_hash[..4]),
                 proposal.identity.name,
                 stage,
@@ -560,13 +587,29 @@ impl VaultUi {
             Mode::ConfirmRemoveMember { name, .. } => {
                 format!("Remove {name}, rotate the epoch key, and invalidate invitations?")
             }
-            _ => "Trusted members, active invitations, and inert access proposals".into(),
+            _ => self.access_detail(),
         };
         frame.render_widget(
             Paragraph::new(detail).block(Block::default().borders(Borders::ALL).title(" Details ")),
             chunks[1],
         );
     }
+}
+
+fn visible_proposals(proposals: Vec<PendingProposal>) -> Vec<PendingProposal> {
+    let finalized_responses = proposals
+        .iter()
+        .filter_map(|proposal| proposal.response_event_hash)
+        .collect::<Vec<_>>();
+    proposals
+        .into_iter()
+        .filter(|proposal| {
+            proposal.response_event_hash.is_some()
+                || !proposal
+                    .owner_response_event_hash
+                    .is_some_and(|response| finalized_responses.contains(&response))
+        })
+        .collect()
 }
 
 impl Drop for VaultUi {
@@ -594,7 +637,7 @@ fn key_help(mode: &Mode) -> &'static str {
         Mode::Value { .. } => "<Enter> append  <Backspace> edit  <Esc> cancel",
         Mode::ConfirmDelete { .. } => "<y>/<Enter> confirm  <n>/<Esc> cancel",
         Mode::Access => {
-            "<j>/<k> select  <n> invite  <s> respond  <a> approve  <c> close  <d> remove  <q>/<Esc> back"
+            "<j>/<k> select  <n> invite  <s> send challenge  <a> admit  <c> close  <d> remove  <q>/<Esc> back"
         }
         Mode::ConfirmRemoveMember { .. } => "<y>/<Enter> confirm  <n>/<Esc> cancel",
     }
