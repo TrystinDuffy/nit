@@ -97,4 +97,11 @@ pub trait IdentityBackend {
     fn discover(&self) -> Result<Vec<DiscoveredIdentity>>;
     fn provision(&self, identity: &DiscoveredIdentity) -> Result<DeviceIdentity>;
     fn open(&self, identity: &DiscoveredIdentity) -> Result<Box<dyn IdentitySession>>;
+
+    fn destroy_and_reprovision_without_user_auth(
+        &self,
+        _identity: &DiscoveredIdentity,
+    ) -> Result<DeviceIdentity> {
+        bail!("this identity backend cannot destructively replace an identity")
+    }
 }

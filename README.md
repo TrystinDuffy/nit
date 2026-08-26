@@ -108,7 +108,15 @@ PIV slot 82   X25519 encryption/key agreement
 PIV slot 83   Ed25519 event signing
 ```
 
-Private keys remain on the device. PIN verification happens once per application session. X25519 requires PIN-once and touch-always; Ed25519 requires PIN-once with touch-cached or touch-always. Existing keys with weaker policies are rejected. Application code uses generic identity traits so software identities can exercise the security-critical replay and crypto code in tests.
+Private keys remain on the device. Normal provisioning uses PIN-once with touch-always for X25519 and touch-cached for Ed25519. Application code uses generic identity traits so software identities can exercise the security-critical replay and crypto code in tests.
+
+PIN and touch policies are immutable after PIV key generation. An explicit destructive replacement can generate both keys with `PIN never` and `touch never`:
+
+```sh
+git vault <vault> destroy-identity --identity yubikey:<serial>
+```
+
+The command requires typing `DESTROY <serial>` and authenticating with the PIV management key. It destroys the old permanent identity and clears its hardware checkpoints; existing vault refs are deliberately left untouched. Any vault that trusted only the destroyed identity becomes inaccessible and must be recovered by another member or nuked and recreated. With neither PIN nor touch, any local process can use the connected YubiKey to decrypt and sign.
 
 The stable member identity is the Ed25519/X25519 public-key pair—not a serial number, Git identity, or certificate fingerprint. YubiKey serials are only local backend locators.
 

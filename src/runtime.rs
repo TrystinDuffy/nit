@@ -53,6 +53,10 @@ pub fn run(cli: Cli) -> Result<()> {
     };
     git::validate_vault_name(&vault)?;
 
+    if matches!(cli.command, Some(Command::DestroyIdentity)) {
+        return destroy_and_reprovision_identity(cli.identity.as_deref());
+    }
+
     if let Some(Command::Fetch { remote }) = &cli.command {
         return fetch_and_advance(&repository, &vault, remote);
     }
@@ -190,7 +194,8 @@ pub fn run(cli: Cli) -> Result<()> {
             session.set_role(&member, role.into())
         }
         Some(
-            Command::Verify
+            Command::DestroyIdentity
+            | Command::Verify
             | Command::Fetch { .. }
             | Command::Push { .. }
             | Command::RequestAccess { .. }
@@ -655,6 +660,36 @@ impl OpenVault {
         }
         result
     }
+}
+
+fn destroy_and_reprovision_identity(requested_identity: Option<&str>) -> Result<()> {
+    require_terminal()?;
+    let selected = choose_identity(
+        discover_identities()?,
+        requested_identity,
+        true,
+        true,
+        "Select the identity to destroy and replace",
+    )?;
+    eprintln!(
+        "WARNING: this permanently destroys identity {} on {}. Every vault that trusts it will become inaccessible unless another member can recover it. The replacement keys will require neither a PIN nor touch, so any local process can use them while the YubiKey is connected.",
+        selected.state.description(),
+        selected.display_name
+    );
+    let expected = format!("DESTROY {}", selected.locator);
+    let confirmation = prompt_line(&format!("Type {expected:?} to continue: "))?;
+    ensure!(confirmation == expected, "identity replacement cancelled");
+    let backend = identity_backend(&selected.backend)?;
+    let replacement = backend.destroy_and_reprovision_without_user_auth(&selected)?;
+    println!(
+        "Replaced {} with unprotected identity {} (PIN never; touch never).",
+        replacement.display_name,
+        replacement.fingerprint()
+    );
+    println!(
+        "Existing vault refs were not changed. Nuke and recreate vaults that only trusted the destroyed identity."
+    );
+    Ok(())
 }
 
 fn create_vault(

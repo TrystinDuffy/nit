@@ -43,9 +43,11 @@ The protocol behavior is implemented and parser/round-trip tested, but productio
 4. Verify management-key algorithms other than the factory-default TDES configuration.
 5. Test full 16-vault objects and explicit capacity failure.
 
-Firmware 5.7.4 or newer is required. Existing slot policies are accepted only when:
+Firmware 5.7.4 or newer and readable policy metadata are required. Normal provisioning uses:
 
 ```text
-slot 82 X25519   PIN once or stronger; touch always
-slot 83 Ed25519  PIN once or stronger; touch cached or always
+slot 82 X25519   PIN once; touch always
+slot 83 Ed25519  PIN once; touch cached
 ```
+
+A deliberately destructive identity-replacement command can instead generate both slots with `PIN never` and `touch never`. This preserves non-exportability but removes user-presence and user-verification protections while the token is connected.

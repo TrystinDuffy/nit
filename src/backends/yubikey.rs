@@ -37,6 +37,7 @@ const INS_GET_METADATA: u8 = 0xF7;
 const INS_GET_SERIAL: u8 = 0xF8;
 const INS_GET_VERSION: u8 = 0xFD;
 const INS_GET_RESPONSE: u8 = 0xC0;
+const INS_MOVE_KEY: u8 = 0xF6;
 
 const TAG_AUTH_WITNESS: u16 = 0x80;
 const TAG_AUTH_CHALLENGE: u16 = 0x81;
@@ -52,6 +53,7 @@ const TAG_METADATA_PUBLIC_KEY: u16 = 0x04;
 const TAG_OBJECT_ID: u16 = 0x5C;
 const TAG_OBJECT_DATA: u16 = 0x53;
 
+const PIN_POLICY_NEVER: u8 = 0x01;
 const PIN_POLICY_ONCE: u8 = 0x02;
 const TOUCH_POLICY_NEVER: u8 = 0x01;
 const TOUCH_POLICY_ALWAYS: u8 = 0x02;
@@ -330,7 +332,7 @@ impl YubiKey {
         input.zeroize();
         let management_algorithm = self.management_key_algorithm()?;
         self.authenticate_management_key(management_algorithm, &management_key)?;
-        self.generate_curve25519(slot, ALG_X25519, TOUCH_POLICY_ALWAYS)
+        self.generate_curve25519(slot, ALG_X25519, PIN_POLICY_ONCE, TOUCH_POLICY_ALWAYS)
     }
 
     pub fn ensure_ed25519_key(&mut self, slot: u8) -> Result<[u8; 32]> {
@@ -368,7 +370,7 @@ impl YubiKey {
         input.zeroize();
         let management_algorithm = self.management_key_algorithm()?;
         self.authenticate_management_key(management_algorithm, &management_key)?;
-        self.generate_curve25519(slot, ALG_ED25519, TOUCH_POLICY_CACHED)
+        self.generate_curve25519(slot, ALG_ED25519, PIN_POLICY_ONCE, TOUCH_POLICY_CACHED)
     }
 
     pub fn sign(&mut self, slot: u8, message: &[u8; 32]) -> Result<[u8; 64]> {
@@ -458,11 +460,12 @@ impl YubiKey {
         if status != 0x9000 {
             return Err(PivStatus(status).into());
         }
-        Ok(Some(
-            find_tlv(&response, TAG_OBJECT_DATA)
-                .context("YubiKey trust object lacks tag 53")?
-                .to_vec(),
-        ))
+        let data =
+            find_tlv(&response, TAG_OBJECT_DATA).context("YubiKey trust object lacks tag 53")?;
+        if data.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(data.to_vec()))
     }
 
     fn write_trust_object(&self, data: &[u8]) -> Result<()> {
@@ -550,14 +553,51 @@ impl YubiKey {
         Ok(())
     }
 
-    fn generate_curve25519(&self, slot: u8, algorithm: u8, touch_policy: u8) -> Result<[u8; 32]> {
+    fn destroy_and_generate_unprotected_identity(&mut self) -> Result<([u8; 32], [u8; 32])> {
+        ensure!(
+            self.version >= [5, 7, 4],
+            "YubiKey firmware must be 5.7.4 or newer"
+        );
+        self.authenticate_management_key_from_terminal()?;
+
+        // An empty object removes the checkpoint data associated with the old keys.
+        self.write_trust_object(&[])?;
+        for slot in [ENCRYPTION_SLOT, SIGNING_SLOT] {
+            if self.slot_metadata(slot)?.is_some() {
+                self.command(0, INS_MOVE_KEY, 0xFF, slot, &[])
+                    .with_context(|| format!("failed to destroy PIV key in slot {slot:02X}"))?;
+            }
+        }
+
+        let encryption_public_key = self.generate_curve25519(
+            ENCRYPTION_SLOT,
+            ALG_X25519,
+            PIN_POLICY_NEVER,
+            TOUCH_POLICY_NEVER,
+        )?;
+        let signing_public_key = self.generate_curve25519(
+            SIGNING_SLOT,
+            ALG_ED25519,
+            PIN_POLICY_NEVER,
+            TOUCH_POLICY_NEVER,
+        )?;
+        Ok((encryption_public_key, signing_public_key))
+    }
+
+    fn generate_curve25519(
+        &self,
+        slot: u8,
+        algorithm: u8,
+        pin_policy: u8,
+        touch_policy: u8,
+    ) -> Result<[u8; 32]> {
         ensure!(
             matches!(algorithm, ALG_X25519 | ALG_ED25519),
             "unsupported Curve25519 algorithm"
         );
         let parameters = [
             tlv(TAG_GEN_ALGORITHM, &[algorithm]),
-            tlv(TAG_PIN_POLICY, &[PIN_POLICY_ONCE]),
+            tlv(TAG_PIN_POLICY, &[pin_policy]),
             tlv(TAG_TOUCH_POLICY, &[touch_policy]),
         ]
         .concat();
@@ -706,6 +746,24 @@ impl IdentityBackend for YubiKeyBackend {
         })
     }
 
+    fn destroy_and_reprovision_without_user_auth(
+        &self,
+        identity: &DiscoveredIdentity,
+    ) -> Result<DeviceIdentity> {
+        ensure!(identity.backend == self.id(), "wrong identity backend");
+        let serial = parse_locator(&identity.locator)?;
+        let mut key = YubiKey::open(Some(serial))?;
+        let (encryption_public_key, signing_public_key) =
+            key.destroy_and_generate_unprotected_identity()?;
+        Ok(DeviceIdentity {
+            backend: self.id().into(),
+            locator: identity.locator.clone(),
+            display_name: identity.display_name.clone(),
+            encryption_public_key,
+            signing_public_key,
+        })
+    }
+
     fn open(&self, identity: &DiscoveredIdentity) -> Result<Box<dyn IdentitySession>> {
         let IdentityState::Ready(device) = &identity.state else {
             bail!("{} is not provisioned", identity.display_name);
@@ -721,35 +779,39 @@ impl IdentityBackend for YubiKeyBackend {
             .context("slot 82 X25519 key is absent")?;
         ensure!(
             encryption_metadata.algorithm == ALG_X25519
-                && pin_policy_is_once_or_stronger(encryption_metadata.pin_policy)
-                && encryption_metadata.touch_policy == Some(TOUCH_POLICY_ALWAYS),
-            "slot 82 must be X25519 with PIN-once-or-stronger and touch-always"
+                && pin_policy_is_supported(encryption_metadata.pin_policy)
+                && touch_policy_is_supported(encryption_metadata.touch_policy),
+            "slot 82 must be X25519 with reported PIN and touch policies"
         );
         let signing_metadata = key
             .slot_metadata(SIGNING_SLOT)?
             .context("slot 83 Ed25519 key is absent")?;
         ensure!(
             signing_metadata.algorithm == ALG_ED25519
-                && pin_policy_is_once_or_stronger(signing_metadata.pin_policy)
-                && matches!(
-                    signing_metadata.touch_policy,
-                    Some(TOUCH_POLICY_ALWAYS) | Some(TOUCH_POLICY_CACHED)
-                ),
-            "slot 83 must be Ed25519 with PIN-once-or-stronger and touch-cached-or-always"
+                && pin_policy_is_supported(signing_metadata.pin_policy)
+                && touch_policy_is_supported(signing_metadata.touch_policy),
+            "slot 83 must be Ed25519 with reported PIN and touch policies"
         );
+        let encryption_touch_policy = encryption_metadata.touch_policy;
         let signing_touch_policy = signing_metadata.touch_policy;
-        let pin = Zeroizing::new(
-            rpassword::prompt_password("PIV PIN: ").context("failed to read PIV PIN")?,
-        );
-        ensure!(
-            !pin.is_empty(),
-            "an empty PIV PIN was not sent to the YubiKey"
-        );
-        key.verify_pin(&pin)?;
+        if encryption_metadata.pin_policy != Some(PIN_POLICY_NEVER)
+            || signing_metadata.pin_policy != Some(PIN_POLICY_NEVER)
+        {
+            let pin = Zeroizing::new(
+                rpassword::prompt_password("PIV PIN: ").context("failed to read PIV PIN")?,
+            );
+            ensure!(
+                !pin.is_empty(),
+                "an empty PIV PIN was not sent to the YubiKey"
+            );
+            key.verify_pin(&pin)?;
+        }
         Ok(Box::new(YubiKeySession {
             key,
             identity: device.clone(),
+            encryption_touch_policy,
             signing_touch_policy,
+            last_agree: None,
             last_sign: None,
         }))
     }
@@ -758,7 +820,9 @@ impl IdentityBackend for YubiKeyBackend {
 struct YubiKeySession {
     key: YubiKey,
     identity: DeviceIdentity,
+    encryption_touch_policy: Option<u8>,
     signing_touch_policy: Option<u8>,
+    last_agree: Option<Instant>,
     last_sign: Option<Instant>,
 }
 
@@ -771,15 +835,18 @@ impl IdentitySession for YubiKeySession {
         let signature = self
             .key
             .sign(SIGNING_SLOT, message)
-            .context("YubiKey did not authorize signing; touch when prompted, or quit and reopen to reverify the PIN")?;
+            .context("YubiKey signing failed")?;
         self.last_sign = Some(Instant::now());
         Ok(signature)
     }
 
     fn agree(&mut self, peer_public_key: &[u8; 32]) -> Result<[u8; 32]> {
-        self.key.agree(ENCRYPTION_SLOT, peer_public_key).context(
-            "YubiKey did not authorize key agreement; touch when prompted, or retry to reverify the PIN",
-        )
+        let shared = self
+            .key
+            .agree(ENCRYPTION_SLOT, peer_public_key)
+            .context("YubiKey key agreement failed")?;
+        self.last_agree = Some(Instant::now());
+        Ok(shared)
     }
 
     fn read_trust_record(&mut self, vault_name: &str) -> Result<Option<VaultTrustRecord>> {
@@ -846,6 +913,15 @@ impl IdentitySession for YubiKeySession {
                 None
             }
             IdentityOperation::Sign => Some("Touch the YubiKey to sign the vault event…"),
+            IdentityOperation::Agree
+                if self.encryption_touch_policy == Some(TOUCH_POLICY_NEVER)
+                    || self.encryption_touch_policy == Some(TOUCH_POLICY_CACHED)
+                        && self
+                            .last_agree
+                            .is_some_and(|last| last.elapsed() < TOUCH_CACHE_WINDOW) =>
+            {
+                None
+            }
             IdentityOperation::Agree => Some("Touch the YubiKey to unlock the membership epoch…"),
         }
     }
@@ -954,30 +1030,27 @@ fn device_policy_error(device: &DeviceInfo) -> Option<String> {
             device.version[0], device.version[1], device.version[2]
         ));
     }
-    if matches!(device.encryption_slot, SlotInfo::X25519(_)) {
-        if !pin_policy_is_once_or_stronger(device.encryption_pin_policy) {
-            return Some("slot 82 X25519 PIN policy is weaker than once".into());
-        }
-        if device.encryption_touch_policy != Some(TOUCH_POLICY_ALWAYS) {
-            return Some("slot 82 X25519 must use touch-always".into());
-        }
+    if matches!(device.encryption_slot, SlotInfo::X25519(_))
+        && (!pin_policy_is_supported(device.encryption_pin_policy)
+            || !touch_policy_is_supported(device.encryption_touch_policy))
+    {
+        return Some("slot 82 X25519 policy metadata is missing or unsupported".into());
     }
-    if matches!(device.signing_slot, SlotInfo::Ed25519(_)) {
-        if !pin_policy_is_once_or_stronger(device.signing_pin_policy) {
-            return Some("slot 83 Ed25519 PIN policy is weaker than once".into());
-        }
-        if !matches!(
-            device.signing_touch_policy,
-            Some(TOUCH_POLICY_ALWAYS) | Some(TOUCH_POLICY_CACHED)
-        ) {
-            return Some("slot 83 Ed25519 must use touch-cached or touch-always".into());
-        }
+    if matches!(device.signing_slot, SlotInfo::Ed25519(_))
+        && (!pin_policy_is_supported(device.signing_pin_policy)
+            || !touch_policy_is_supported(device.signing_touch_policy))
+    {
+        return Some("slot 83 Ed25519 policy metadata is missing or unsupported".into());
     }
     None
 }
 
-fn pin_policy_is_once_or_stronger(policy: Option<u8>) -> bool {
-    matches!(policy, Some(2..=5))
+fn pin_policy_is_supported(policy: Option<u8>) -> bool {
+    matches!(policy, Some(1..=5))
+}
+
+fn touch_policy_is_supported(policy: Option<u8>) -> bool {
+    matches!(policy, Some(1..=3))
 }
 
 fn pin_policy_description(policy: Option<u8>) -> &'static str {
