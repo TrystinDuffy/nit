@@ -11,6 +11,7 @@ use zeroize::Zeroize;
 use crate::{
     crypto::VaultValue,
     event::EpochMember,
+    invitation,
     keys::InputKey,
     state::{InvitationState, PendingProposal},
 };
@@ -26,7 +27,6 @@ pub enum Effect {
     RemoveMember { signing_public_key: [u8; 32] },
     CreateInvitation,
     CloseInvitation { invitation_id: [u8; 16] },
-    RespondProposal { proposal_event_hash: [u8; 32] },
     ApproveProposal { proposal_event_hash: [u8; 32] },
     Output(String),
     Quit,
@@ -367,38 +367,13 @@ impl VaultUi {
                 }
                 Effect::None
             }
-            InputKey::Char('s') => {
-                let Some(proposal) = self.selected_proposal() else {
-                    self.status = "Select a new join request to send its challenge".into();
-                    return Effect::None;
-                };
-                if proposal.response_event_hash.is_some() {
-                    self.status = "Phrase proof is complete; press <a> to admit this member".into();
-                    Effect::None
-                } else if proposal.owner_response_event_hash.is_some() {
-                    self.status = format!(
-                        "Challenge already sent; reopen with {}'s requesting key to finish the phrase proof",
-                        proposal.identity.name
-                    );
-                    Effect::None
-                } else {
-                    Effect::RespondProposal {
-                        proposal_event_hash: proposal.event_hash,
-                    }
-                }
-            }
             InputKey::Char('a') => {
                 let Some(proposal) = self.selected_proposal() else {
                     self.status = "Select a completed phrase proof to admit".into();
                     return Effect::None;
                 };
-                if proposal.response_event_hash.is_none() {
-                    self.status = "Phrase proof is not complete yet".into();
-                    Effect::None
-                } else {
-                    Effect::ApproveProposal {
-                        proposal_event_hash: proposal.event_hash,
-                    }
+                Effect::ApproveProposal {
+                    proposal_event_hash: proposal.event_hash,
                 }
             }
             InputKey::Char('c') => {
@@ -444,22 +419,17 @@ impl VaultUi {
     }
 
     fn access_detail(&self) -> String {
-        if let Some(proposal) = self.selected_proposal() {
-            if proposal.response_event_hash.is_some() {
-                return "The requester proved the invitation phrase. Press <a> to admit this member."
-                    .into();
-            }
-            if proposal.owner_response_event_hash.is_some() {
-                return format!(
-                    "Challenge sent. Reopen with {}'s requesting YubiKey to finish the phrase proof.",
-                    proposal.identity.name
-                );
-            }
-            return "New join request. Press <s> to send the requester a PAKE challenge.".into();
-        }
-        if self.selected_invitation().is_some() {
-            return "Invitation is open. The requester selects it and enters its four-word phrase."
+        if self.selected_proposal().is_some() {
+            return "The requester submitted a phrase proof. Press <a> to verify it and admit the member."
                 .into();
+        }
+        if let Some(invitation) = self.selected_invitation() {
+            return if invitation::is_spake2_invitation(&invitation.pake_message) {
+                "Invitation challenge is open. The requester selects it and submits a four-word phrase proof."
+                    .into()
+            } else {
+                "This invitation uses the obsolete multi-round PAKE. Press <c> to close it.".into()
+            };
         }
         "Trusted members, active invitations, and join requests".into()
     }
@@ -542,20 +512,19 @@ impl VaultUi {
             )));
         }
         for invitation in &self.invitations {
+            let protocol = if invitation::is_spake2_invitation(&invitation.pake_message) {
+                "SPAKE2"
+            } else {
+                "obsolete PAKE — close"
+            };
             items.push(ListItem::new(format!(
-                "  active invitation  {}  expires {}",
+                "  active invitation  {}  {protocol}  expires {}",
                 hex::encode_upper(&invitation.invitation_id[..4]),
                 invitation.expires_at
             )));
         }
         for proposal in &self.proposals {
-            let stage = if proposal.response_event_hash.is_some() {
-                "phrase proof complete — ready to admit"
-            } else if proposal.owner_response_event_hash.is_some() {
-                "challenge sent — requester must finish"
-            } else {
-                "new — owner must send challenge"
-            };
+            let stage = "phrase proof submitted — ready to verify/admit";
             items.push(ListItem::new(format!(
                 "  join request  {}  {}  {}  {:?}",
                 hex::encode_upper(&proposal.event_hash[..4]),
@@ -637,7 +606,7 @@ fn key_help(mode: &Mode) -> &'static str {
         Mode::Value { .. } => "<Enter> append  <Backspace> edit  <Esc> cancel",
         Mode::ConfirmDelete { .. } => "<y>/<Enter> confirm  <n>/<Esc> cancel",
         Mode::Access => {
-            "<j>/<k> select  <n> invite  <s> send challenge  <a> admit  <c> close  <d> remove  <q>/<Esc> back"
+            "<j>/<k> select  <n> invite  <a> verify/admit  <c> close  <d> remove  <q>/<Esc> back"
         }
         Mode::ConfirmRemoveMember { .. } => "<y>/<Enter> confirm  <n>/<Esc> cancel",
     }

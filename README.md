@@ -15,7 +15,7 @@ The interactive TUI derives a verified trusted projection, unlocks the current m
 
 Successful secret edits immediately append immutable, signed events.
 
-> **Early security prototype:** the event log, trusted replay, epoch encryption, Git plumbing, fork detection, Ed25519/X25519 hardware identities, and audited OPAQUE onboarding are implemented and tested. X.509 identity envelopes and persistent YubiKey membership checkpoints remain incomplete. Do not use this as the only copy of important secrets.
+> **Early security prototype:** the event log, trusted replay, epoch encryption, Git plumbing, fork detection, Ed25519/X25519 hardware identities, and SPAKE2 onboarding are implemented and tested. The selected Rust SPAKE2 implementation has not received an independent audit. X.509 identity envelopes and persistent YubiKey membership checkpoints remain incomplete. Do not use this as the only copy of important secrets.
 
 ## Storage model
 
@@ -32,7 +32,7 @@ Additional refs are isolated by purpose:
 ```text
 refs/vault-remotes/<remote>/<vault>   fetched, untrusted remote state
 refs/vault-local/<vault>              local freshness checkpoint object
-refs/vault-onboarding/<vault>/<event> requester-only OPAQUE continuation state
+refs/vault-onboarding/<vault>/<event> requester-only PAKE session state
 ```
 
 Git stores, synchronizes, and retains history. Git commits, authors, timestamps, and ancestry do not decide event authorization.
@@ -53,7 +53,7 @@ raw event log
 The code uses three distinct validation levels:
 
 - **Structurally valid:** canonical fields and lengths are valid and the Ed25519 signature verifies.
-- **Invitation-authenticated proposal:** a proposal has additionally completed the audited OPAQUE exchange and explicit key confirmation.
+- **Invitation-authenticated proposal:** an owner has additionally verified the proposal's SPAKE2 phrase proof and explicit key confirmation.
 - **Trusted event:** the event extends the current trust hash and its signer was authorized for that event type by the previous trusted state.
 
 Structurally valid but unauthorized events remain inert. A removed member can continue appending mathematically valid signatures, but those events cannot extend the trusted state.
@@ -129,10 +129,8 @@ git vault prod delete TOKEN
 git vault prod members
 git vault prod invite --minutes 30 --words 4
 git vault prod request-access <invitation> --name Bob
-git vault prod respond <proposal-start>
-git vault prod continue-request <proposal-start>
-git vault prod approve <final-proposal>
-git vault prod confirm-access <final-proposal>
+git vault prod approve <phrase-proof>
+git vault prod confirm-access <phrase-proof>
 git vault prod remove-member <name-or-fingerprint>
 git vault prod set-role <name-or-fingerprint> reader
 git vault prod verify
@@ -170,22 +168,20 @@ Never configure `refs/vault-local/*` or `refs/vault-onboarding/*` for pushing. T
 
 ## Invitations and membership management
 
-The binary event model includes immutable `CreateInvitation`, `InvitationResponse`, `CloseInvitation`, and staged `ProposeUser` records. `git-vault` uses `opaque-ke` 3.0 with Ristretto255, TripleDH, and Argon2. The implementation lineage was independently audited by NCC Group; the older unaudited SPAKE2 crate was not selected. The review is recorded in [`docs/pake-review.md`](docs/pake-review.md).
+The binary event model uses immutable `CreateInvitation`, `CloseInvitation`, and `ProposeUser` records. `git-vault` uses RustCrypto `spake2` 0.4 with Ed25519-group parameters and explicit HMAC key confirmation. This crate warns that it has not received an independent third-party audit; the decision and limits are recorded in [`docs/pake-review.md`](docs/pake-review.md).
 
-The user-visible sequence is intentionally explicit because OPAQUE needs three PAKE messages plus admission:
+The user-visible exchange is:
 
-1. **Owner:** create an invitation and share its four-word phrase.
-2. **Requester:** select the invitation, enter the phrase, and start a join request.
-3. **Owner:** send the PAKE challenge for that join request.
-4. **Requester:** reopen with the requesting identity and enter the phrase again to finish the proof.
-5. **Owner:** admit the member after the proof is complete.
-6. **Requester:** verify the exact admission epoch before accepting/checkpointing membership.
+1. **Owner:** create an invitation challenge and share its four-word phrase.
+2. **Requester:** select the invitation, enter the phrase, and submit a signed phrase proof.
+3. **Owner:** verify that proof and sign the membership admission.
+4. **Requester:** automatically verify the exact admission epoch when it next opens the vault.
 
-Internally these are an OPAQUE credential request, server response, credential finalization, owner-signed membership epoch, and admission confirmation. Requester continuation state lives only under `refs/vault-onboarding/*`.
+The owner's resumable SPAKE2 state, including the phrase, is encrypted under the current membership epoch key. The public Git transcript provides no passive offline phrase verifier. Requester session state lives only under `refs/vault-onboarding/*` and contains no phrase.
 
 When participants use different clones, they run `git vault <name> push`/`fetch` between these append steps. The PAKE protocol itself is transport-independent. In interactive mode, selecting an untrusted or provisionable YubiKey starts or resumes this invitation workflow instead of attempting to unlock the vault as a trusted member.
 
-OPAQUE context and admission confirmation bind:
+SPAKE2 identities, requester confirmation, and admission confirmation bind:
 
 ```text
 vault ID
@@ -195,7 +191,7 @@ new membership epoch
 trusted membership hash
 ```
 
-A proposal remains inert until an existing owner signs the membership epoch that references that exact immutable final proposal. Wrong phrases and repository parameter substitution fail OPAQUE confirmation without creating a public offline phrase verifier.
+A phrase proof remains inert until an existing owner verifies it and signs the membership epoch referencing that exact immutable proposal. A wrong phrase produces a different SPAKE2 key and fails requester confirmation. Each active owner verification permits one online phrase guess; the public transcript does not permit passive offline guessing.
 
 ## Rollback anchors
 
@@ -279,7 +275,7 @@ src/event.rs               canonical events and bounded stream parser
 src/state.rs               pure trusted replay, authorization, forks, rollback checks
 src/crypto.rs              epoch wrapping, snapshots, typed value AEAD
 src/identity.rs            backend-neutral hardware identity traits
-src/invitation.rs          audited OPAQUE onboarding and admission confirmation
+src/invitation.rs          SPAKE2 onboarding and admission confirmation
 src/backends/yubikey.rs    PC/SC and PIV implementation
 src/backends/test_identity.rs software identity for deterministic tests
 src/runtime.rs             command orchestration and immediate event appends

@@ -2,71 +2,68 @@
 
 ## Decision
 
-`git-vault` uses `opaque-ke` 3.0 rather than the RustCrypto `spake2` crate.
+`git-vault` uses RustCrypto `spake2` 0.4 with its Ed25519-group parameter set and explicit HMAC key confirmation.
 
-Reasons:
+The crate states that it has **not** received an independent third-party audit and may not be constant-time. This is a material limitation. `git-vault` remains an early security prototype.
 
-- OPAQUE is an augmented PAKE designed to avoid a public offline password verifier.
-- The `opaque-ke` implementation reports an independent NCC Group audit of an earlier release, with the resulting fixes incorporated by release 1.2.
-- Version 3.0 is stable and supports the project's Rust toolchain.
-- The reviewed stable SPAKE2 crate explicitly states that it has not received an independent third-party audit; its newer release is pre-release.
+OPAQUE through `opaque-ke` was previously selected because that implementation lineage had received an NCC Group audit. It was removed because its augmented client/server login topology required an additional asynchronous server response and requester finalization. That did not match the required invitation pairing flow.
 
-Version 3 of `opaque-ke` follows the OPAQUE draft lineage rather than claiming byte compatibility with a final RFC profile. The exact crate version and canonical outer event encoding are therefore protocol-versioned and locked.
+No custom PAKE primitive is implemented.
 
-## Git transcript
+## Required exchange
 
-The transport is an asynchronous, attacker-writable Git event log. The implemented exchange is:
+The implemented exchange has three event-producing actions:
 
-1. `CreateInvitation` — trusted owner event containing the OPAQUE password file and an epoch-encrypted `ServerSetup`.
-2. `ProposeUser` start — signed but inert requester event containing OPAQUE `CredentialRequest`.
-3. `InvitationResponse` — trusted owner event containing `CredentialResponse` and epoch-encrypted serialized `ServerLogin` state.
-4. `ProposeUser` final — signed but inert requester event containing OPAQUE `CredentialFinalization` and an immutable reference to the response.
-5. `MembershipEpoch` — trusted owner event referencing the exact final proposal and containing admission key confirmation.
-6. Requester confirmation — local verification of the exact admission epoch before the hardware checkpoint is accepted.
+1. **Owner invitation:** generates the phrase and a SPAKE2 role-B message.
+2. **Requester phrase proof:** generates role A, derives the shared key from the invitation challenge, and appends the role-A message plus explicit requester confirmation.
+3. **Owner admission:** derives the same key, verifies requester confirmation, and appends the owner-signed membership epoch with admission confirmation.
 
-Requester `ClientLogin` continuation state is stored only through a local Git object referenced by:
+The requester verifies admission confirmation automatically the next time it opens the vault. That local verification does not append another protocol message.
 
-```text
-refs/vault-onboarding/<vault>/<proposal-event-hash>
-```
+## Resumable owner state
 
-These refs are never pushed by `git-vault`. The phrase itself is never stored.
+The `spake2` crate does not serialize its state object. It does expose `start_b_with_rng`, so `git-vault` stores:
 
-## Binding
+- a fresh 256-bit ChaCha20 RNG seed;
+- the random invitation phrase.
 
-OPAQUE's context binds:
+Both are authenticated-encrypted under the current membership epoch key. Reconstructing role B with the same seed must reproduce the exact public invitation challenge before a join proof is accepted. The phrase and seed are never public Git fields.
 
-- vault ID;
-- invitation ID;
+Membership rotation invalidates all invitations and their encrypted owner state.
+
+## Binding and confirmation
+
+SPAKE2 identity strings bind the vault ID, invitation ID, and trusted parent hash.
+
+Requester HMAC confirmation additionally binds:
+
 - trusted invitation event hash;
-- requester proposal-start event hash;
-- proposed Ed25519 key;
-- proposed X25519 key.
+- complete proposed Ed25519/X25519 identity;
+- both SPAKE2 messages.
 
-The final membership event contains an HMAC under the OPAQUE session key over a domain-separated digest of:
+The owner admission HMAC binds:
 
 - vault ID;
 - parent trusted-state hash;
-- immutable final proposal hash;
-- complete new membership epoch excluding the confirmation field itself.
+- exact accepted proposal hash;
+- complete new membership epoch, excluding the confirmation field itself.
 
-This gives the requester explicit confirmation of the exact admission result rather than merely observing its identity somewhere in an attacker-controlled Git log.
+The join proposal is also signed by its proposed Ed25519 key. It remains inert until an existing owner verifies the PAKE confirmation and signs the membership epoch.
 
-## Repository attacker
+## Guessing properties
 
-A repository writer can append arbitrary credential requests, fake invitations, responses, and finalizations. They cannot make an untrusted invitation active, replace the parameters of a trusted owner event, complete OPAQUE without an online phrase guess, or make a proposal trusted without an owner-signed membership epoch.
+A passive repository reader sees both SPAKE2 group messages and confirmation tags but cannot test phrase guesses offline under SPAKE2's security model.
 
-Public password files and PAKE transcripts do not act as offline phrase verifiers under OPAQUE's security model. Each active attempt still creates bounded log traffic, so event, proposal, and invitation limits remain necessary.
+A malicious repository writer may submit arbitrary join attempts. Each attempt that an owner actively verifies permits one online phrase guess. Owners therefore choose which proposal to verify, invitations expire, membership changes invalidate invitations, and event/proposal limits bound log growth.
 
 ## Tests
 
 The implementation tests:
 
-- correct phrase completion;
-- wrong phrase failure;
-- equal client/server session keys;
-- exact invitation/identity/response binding;
+- matching phrase shared-key agreement;
+- wrong-phrase confirmation failure;
+- invitation/context substitution resistance;
 - proposal inertia before owner admission;
-- owner admission referencing the exact final proposal;
-- admission confirmation under the OPAQUE session key;
-- local continuation-state Git refs.
+- admission of the exact proposal identity;
+- requester verification of exact admission confirmation;
+- local requester session-state Git refs.

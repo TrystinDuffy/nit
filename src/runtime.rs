@@ -62,20 +62,6 @@ pub fn run(cli: Cli) -> Result<()> {
             *phrase_stdin,
         );
     }
-    if let Some(Command::ContinueRequest {
-        proposal,
-        phrase_stdin,
-    }) = &cli.command
-    {
-        return continue_request(
-            &repository,
-            &cli.vault,
-            stored.context("vault does not exist")?,
-            cli.identity.as_deref(),
-            proposal,
-            *phrase_stdin,
-        );
-    }
     if let Some(Command::ConfirmAccess { proposal }) = &cli.command {
         return confirm_access(
             &repository,
@@ -165,12 +151,6 @@ pub fn run(cli: Cli) -> Result<()> {
             print_identity_hint(session.identity.as_ref(), IdentityOperation::Sign);
             session.close_invitation(&invitation)
         }
-        Some(Command::Respond { proposal }) => {
-            print_identity_hint(session.identity.as_ref(), IdentityOperation::Sign);
-            let response = session.respond_to_proposal(&proposal)?;
-            println!("{}", hex::encode_upper(response));
-            Ok(())
-        }
         Some(Command::Approve { proposal }) => {
             print_identity_hint(session.identity.as_ref(), IdentityOperation::Sign);
             session.approve_proposal(&proposal)
@@ -188,7 +168,6 @@ pub fn run(cli: Cli) -> Result<()> {
             | Command::Fetch { .. }
             | Command::Push { .. }
             | Command::RequestAccess { .. }
-            | Command::ContinueRequest { .. }
             | Command::ConfirmAccess { .. },
         ) => unreachable!(),
         None => session.run_tui(),
@@ -271,7 +250,7 @@ impl OpenVault {
                 expires_at,
                 pake_message,
             },
-            "create OPAQUE invitation",
+            "create SPAKE2 invitation challenge",
         )?;
         Ok((invitation_id, phrase))
     }
@@ -284,65 +263,8 @@ impl OpenVault {
         )
     }
 
-    fn respond_to_proposal(&mut self, selector: &str) -> Result<Hash> {
-        let proposal = select_proposal(&self.state, selector, false)?.clone();
-        ensure!(
-            proposal.response_event_hash.is_none(),
-            "proposal already contains an OPAQUE finalization"
-        );
-        ensure!(
-            !self
-                .state
-                .invitation_responses
-                .values()
-                .any(|response| response.proposal_event_hash == proposal.event_hash),
-            "proposal already has an owner response"
-        );
-        let invitation = self
-            .state
-            .active_invitations
-            .get(&proposal.invitation_id)
-            .context("proposal invitation is no longer active")?;
-        let event = find_event(&self.log, &proposal.event_hash)?;
-        let EventPayload::ProposeUser { pake_message, .. } = &event.payload else {
-            unreachable!()
-        };
-        let pake_response = invitation::create_server_response(
-            &self.state.vault_id,
-            invitation,
-            &proposal.event_hash,
-            &proposal.identity,
-            pake_message,
-            &self.epoch_key,
-        )?;
-        self.append_payload(
-            EventPayload::InvitationResponse {
-                epoch_number: self.state.membership_epoch,
-                invitation_id: proposal.invitation_id,
-                proposal_event_hash: proposal.event_hash,
-                pake_message: pake_response,
-            },
-            "respond to OPAQUE proposal",
-        )?;
-        let response = self
-            .state
-            .invitation_responses
-            .values()
-            .find(|response| response.proposal_event_hash == proposal.event_hash)
-            .context("trusted response was not derived after append")?;
-        Ok(response.event_hash)
-    }
-
     fn approve_proposal(&mut self, selector: &str) -> Result<()> {
-        let proposal = select_proposal(&self.state, selector, true)?.clone();
-        let response_hash = proposal
-            .response_event_hash
-            .context("proposal has not completed the OPAQUE exchange")?;
-        let response = self
-            .state
-            .invitation_responses
-            .get(&response_hash)
-            .context("proposal references an untrusted OPAQUE response")?;
+        let proposal = select_proposal(&self.state, selector, false)?.clone();
         let invitation = self
             .state
             .active_invitations
@@ -352,10 +274,9 @@ impl OpenVault {
         let EventPayload::ProposeUser { pake_message, .. } = &event.payload else {
             unreachable!()
         };
-        let (_authentication, session_key) = invitation::authenticate_final_proposal(
+        let (_authentication, session_key) = invitation::authenticate_proposal(
             &self.state.vault_id,
             invitation,
-            response,
             pake_message,
             &proposal.identity,
             &self.epoch_key,
@@ -414,7 +335,7 @@ impl OpenVault {
         )?);
         self.append_payload(
             EventPayload::MembershipEpoch(epoch),
-            "admit OPAQUE-authenticated member",
+            "admit SPAKE2-authenticated member",
         )?;
         self.epoch_key = next_epoch_key;
         let _ = self
@@ -563,7 +484,7 @@ impl OpenVault {
             self.values.clone(),
             self.state.members.clone(),
             invitations,
-            self.state.pending_proposals.clone(),
+            supported_proposals(&self.state),
         );
         let mut outputs = Vec::new();
         let result = with_terminal(|terminal| loop {
@@ -579,7 +500,6 @@ impl OpenVault {
                     | Effect::RemoveMember { .. }
                     | Effect::CreateInvitation
                     | Effect::CloseInvitation { .. }
-                    | Effect::RespondProposal { .. }
                     | Effect::ApproveProposal { .. }
             );
             if uses_signing_identity {
@@ -635,20 +555,6 @@ impl OpenVault {
                             app.set_status("Invitation closed");
                         }
                         Err(error) => app.set_status(format!("Invitation not closed: {error:#}")),
-                    }
-                }
-                Effect::RespondProposal {
-                    proposal_event_hash,
-                } => {
-                    let selector = hex::encode_upper(proposal_event_hash);
-                    match self.respond_to_proposal(&selector) {
-                        Ok(_) => {
-                            refresh_access_view(&mut app, &self.state);
-                            app.set_status(
-                                "Challenge sent. Next: reopen with the requesting YubiKey to finish the phrase proof",
-                            );
-                        }
-                        Err(error) => app.set_status(format!("Challenge not sent: {error:#}")),
                     }
                 }
                 Effect::ApproveProposal {
@@ -825,48 +731,27 @@ fn run_interactive_existing(
                     && proposal.identity.encryption_public_key == device.encryption_public_key
             })
             .collect::<Vec<_>>();
-        if let Some(final_proposal) = matching
-            .iter()
-            .copied()
-            .find(|proposal| proposal.response_event_hash.is_some())
-        {
+        if let Some(proposal) = matching.first() {
             println!(
-                "Phrase proof {} is complete; an owner must admit this member before it can open the vault.",
-                hex::encode_upper(&final_proposal.event_hash[..8])
-            );
-            return Ok(());
-        }
-        if let Some(start) = matching
-            .iter()
-            .copied()
-            .find(|proposal| proposal.owner_response_event_hash.is_some())
-        {
-            return continue_request(
-                repository,
-                vault_name,
-                stored,
-                Some(&selector),
-                &hex::encode_upper(start.event_hash),
-                false,
-            );
-        }
-        if let Some(start) = matching.first() {
-            println!(
-                "Join request {} is waiting for the owner to send a challenge.",
-                hex::encode_upper(&start.event_hash[..8])
+                "Phrase proof {} is waiting for an owner to verify and admit it.",
+                hex::encode_upper(&proposal.event_hash[..8])
             );
             return Ok(());
         }
     }
 
+    let supported_invitations = state
+        .active_invitations
+        .values()
+        .filter(|invitation| invitation::is_spake2_invitation(&invitation.pake_message))
+        .collect::<Vec<_>>();
     ensure!(
-        !state.active_invitations.is_empty(),
-        "this identity is not trusted and the vault has no active invitation"
+        !supported_invitations.is_empty(),
+        "this identity is not trusted and the vault has no active SPAKE2 invitation; close obsolete invitations and create a new one"
     );
     let invitation_selector = choose_option(
-        state
-            .active_invitations
-            .values()
+        supported_invitations
+            .into_iter()
             .map(|invitation| {
                 let id = hex::encode_upper(invitation.invitation_id);
                 (
@@ -1057,8 +942,8 @@ fn request_access(
     let mut identity = backend.open(&ready)?;
     let proposed = member_identity(&device, name.to_owned());
     let mut phrase = read_phrase(phrase_stdin)?;
-    let (client_state, credential_request) =
-        invitation::start_proposal(&invitation, proposed.clone(), &phrase)?;
+    let (phrase_proof, session_key) =
+        invitation::start_proposal(&state.vault_id, &invitation, &proposed, &phrase)?;
     phrase.zeroize();
     print_identity_hint(identity.as_ref(), IdentityOperation::Sign);
     let event = Event::unsigned(
@@ -1067,9 +952,9 @@ fn request_access(
         device.signing_public_key,
         EventPayload::ProposeUser {
             invitation_id: invitation.invitation_id,
-            identity: proposed,
+            identity: proposed.clone(),
             response_event_hash: None,
-            pake_message: credential_request,
+            pake_message: phrase_proof,
         },
     )
     .sign(identity.as_mut())?;
@@ -1079,120 +964,22 @@ fn request_access(
         vault_name,
         stored,
         event,
-        "start OPAQUE access proposal",
+        "submit SPAKE2 invitation phrase proof",
     )?;
-    let mut encoded = invitation::encode_client_start_state(&client_state)?;
+    let session_state = ClientSessionState {
+        invitation_id: invitation.invitation_id,
+        invitation_event_hash: invitation.create_event_hash,
+        final_proposal_hash: event_hash,
+        proposal_identity: proposed,
+        session_key,
+    };
+    let mut encoded = invitation::encode_client_session_state(&session_state)?;
     repository.write_onboarding_state(vault_name, &event_hash, &encoded)?;
     encoded.zeroize();
     println!("{}", hex::encode_upper(event_hash));
     eprintln!(
-        "Join request started. Next: the owner must run `git vault {vault_name} respond {}` to send the PAKE challenge.",
+        "Invitation phrase proof submitted. Next: the owner must run `git vault {vault_name} approve {}` to verify and admit this member.",
         hex::encode_upper(&event_hash[..8])
-    );
-    Ok(())
-}
-
-fn continue_request(
-    repository: &GitRepository,
-    vault_name: &str,
-    stored: StoredLog,
-    requested_identity: Option<&str>,
-    proposal_selector: &str,
-    phrase_stdin: bool,
-) -> Result<()> {
-    let state = derive_with_checkpoints(repository, vault_name, &stored.log, None)?;
-    ensure!(
-        state.fork.is_none(),
-        "cannot continue access while a trusted fork is unresolved"
-    );
-    let proposal = select_proposal(&state, proposal_selector, false)?.clone();
-    ensure!(
-        proposal.response_event_hash.is_none(),
-        "selected proposal is already final"
-    );
-    let response = state
-        .invitation_responses
-        .values()
-        .find(|response| response.proposal_event_hash == proposal.event_hash)
-        .context("an owner has not responded to this proposal yet")?
-        .clone();
-    let invitation = state
-        .active_invitations
-        .get(&proposal.invitation_id)
-        .context("proposal invitation is no longer active")?
-        .clone();
-    let mut local =
-        Zeroizing::new(repository.read_onboarding_state(vault_name, &proposal.event_hash)?);
-    let client_state = invitation::decode_client_start_state(&local)?;
-    local.zeroize();
-    ensure!(
-        client_state.proposal_identity == proposal.identity,
-        "local proposal identity mismatch"
-    );
-    let selected = choose_identity(
-        discover_identities()?,
-        requested_identity,
-        false,
-        true,
-        "Select the identity that started the request",
-    )?;
-    let IdentityState::Ready(device) = &selected.state else {
-        bail!("selected identity is not provisioned");
-    };
-    ensure!(
-        device.signing_public_key == proposal.identity.signing_public_key
-            && device.encryption_public_key == proposal.identity.encryption_public_key,
-        "selected identity did not start this proposal"
-    );
-    let backend = identity_backend(&selected.backend)?;
-    let mut identity = backend.open(&selected)?;
-    let mut phrase = read_phrase(phrase_stdin)?;
-    let (finalization, session_key) = invitation::finish_proposal(
-        &state.vault_id,
-        &invitation,
-        &proposal.event_hash,
-        &response,
-        client_state,
-        &phrase,
-    )?;
-    phrase.zeroize();
-    print_identity_hint(identity.as_ref(), IdentityOperation::Sign);
-    let event = Event::unsigned(
-        state.vault_id,
-        state.current_trust_hash,
-        device.signing_public_key,
-        EventPayload::ProposeUser {
-            invitation_id: proposal.invitation_id,
-            identity: proposal.identity.clone(),
-            response_event_hash: Some(response.event_hash),
-            pake_message: finalization,
-        },
-    )
-    .sign(identity.as_mut())?;
-    let final_hash = event.event_hash()?;
-    append_candidate(
-        repository,
-        vault_name,
-        stored,
-        event,
-        "finish OPAQUE access proposal",
-    )?;
-    let session_state = ClientSessionState {
-        invitation_id: proposal.invitation_id,
-        invitation_event_hash: invitation.create_event_hash,
-        response_event_hash: response.event_hash,
-        final_proposal_hash: final_hash,
-        proposal_identity: proposal.identity,
-        session_key,
-    };
-    let mut encoded = invitation::encode_client_session_state(&session_state)?;
-    repository.write_onboarding_state(vault_name, &final_hash, &encoded)?;
-    encoded.zeroize();
-    repository.delete_onboarding_state(vault_name, &proposal.event_hash)?;
-    println!("{}", hex::encode_upper(final_hash));
-    eprintln!(
-        "Invitation phrase proved. Next: the owner must run `git vault {vault_name} approve {}` to admit this member.",
-        hex::encode_upper(&final_hash[..8])
     );
     Ok(())
 }
@@ -1205,13 +992,7 @@ fn confirm_access(
     proposal_selector: &str,
 ) -> Result<OpenVault> {
     let final_event = select_event(&stored.log, proposal_selector, |event| {
-        matches!(
-            event.payload,
-            EventPayload::ProposeUser {
-                response_event_hash: Some(_),
-                ..
-            }
-        )
+        matches!(event.payload, EventPayload::ProposeUser { .. })
     })?;
     let final_hash = final_event.event_hash()?;
     let mut local = Zeroizing::new(repository.read_onboarding_state(vault_name, &final_hash)?);
@@ -1219,7 +1000,7 @@ fn confirm_access(
     local.zeroize();
     ensure!(
         session.final_proposal_hash == final_hash,
-        "local OPAQUE session mismatch"
+        "local SPAKE2 session mismatch"
     );
     let state = derive_with_checkpoints(repository, vault_name, &stored.log, None)?;
     let admission_event = stored
@@ -1427,8 +1208,24 @@ fn refresh_access_view(app: &mut VaultUi, state: &TrustedState) {
     app.refresh_access(
         state.members.clone(),
         state.active_invitations.values().cloned().collect(),
-        state.pending_proposals.clone(),
+        supported_proposals(state),
     );
+}
+
+fn supported_proposals(state: &TrustedState) -> Vec<crate::state::PendingProposal> {
+    state
+        .pending_proposals
+        .iter()
+        .filter(|proposal| {
+            state
+                .active_invitations
+                .get(&proposal.invitation_id)
+                .is_some_and(|invitation| {
+                    invitation::is_spake2_invitation(&invitation.pake_message)
+                })
+        })
+        .cloned()
+        .collect()
 }
 
 fn select_invitation<'a>(
@@ -1667,7 +1464,7 @@ mod integration_tests {
     }
 
     #[test]
-    fn opaque_proposal_is_inert_until_owner_admission_epoch() {
+    fn spake2_phrase_proof_is_inert_until_owner_admission_epoch() {
         let directory = TempDir::new().unwrap();
         ProcessCommand::new("git")
             .args(["init", "--quiet"])
@@ -1735,76 +1532,22 @@ mod integration_tests {
         let bob_device = bob_backend.provision(&bob_discovered).unwrap();
         let mut bob = bob_backend.open(&bob_discovered).unwrap();
         let bob_member = member_identity(&bob_device, "Bob".into());
-        let (client_state, request) =
-            invitation::start_proposal(&invitation, bob_member.clone(), &phrase).unwrap();
-        let start = Event::unsigned(
-            vault_id,
-            vault.state.current_trust_hash,
-            bob_device.signing_public_key,
-            EventPayload::ProposeUser {
-                invitation_id: invitation.invitation_id,
-                identity: bob_member.clone(),
-                response_event_hash: None,
-                pake_message: request,
-            },
-        )
-        .sign(bob.as_mut())
-        .unwrap();
-        let start_hash = start.event_hash().unwrap();
-        let stored = append_candidate(
-            &repository,
-            "onboard",
-            StoredLog {
-                commit_oid: vault.commit_oid.clone(),
-                log: vault.log.clone(),
-            },
-            start,
-            "start proposal",
-        )
-        .unwrap();
-        vault.commit_oid = stored.commit_oid;
-        vault.log = stored.log;
-        vault.state = derive_trusted_state(
-            &vault.log.events,
-            &DeriveOptions {
-                now: now_unix(),
-                ..DeriveOptions::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(vault.state.members.len(), 1);
-        let response_hash = vault
-            .respond_to_proposal(&hex::encode_upper(start_hash))
-            .unwrap();
-        let response = vault
-            .state
-            .invitation_responses
-            .get(&response_hash)
-            .unwrap()
-            .clone();
-        let (finalization, client_session_key) = invitation::finish_proposal(
-            &vault_id,
-            &invitation,
-            &start_hash,
-            &response,
-            client_state,
-            &phrase,
-        )
-        .unwrap();
-        let final_event = Event::unsigned(
+        let (phrase_proof, client_session_key) =
+            invitation::start_proposal(&vault_id, &invitation, &bob_member, &phrase).unwrap();
+        let proposal = Event::unsigned(
             vault_id,
             vault.state.current_trust_hash,
             bob_device.signing_public_key,
             EventPayload::ProposeUser {
                 invitation_id: invitation.invitation_id,
                 identity: bob_member,
-                response_event_hash: Some(response_hash),
-                pake_message: finalization,
+                response_event_hash: None,
+                pake_message: phrase_proof,
             },
         )
         .sign(bob.as_mut())
         .unwrap();
-        let final_hash = final_event.event_hash().unwrap();
+        let final_hash = proposal.event_hash().unwrap();
         let stored = append_candidate(
             &repository,
             "onboard",
@@ -1812,8 +1555,8 @@ mod integration_tests {
                 commit_oid: vault.commit_oid.clone(),
                 log: vault.log.clone(),
             },
-            final_event,
-            "finish proposal",
+            proposal,
+            "submit phrase proof",
         )
         .unwrap();
         vault.commit_oid = stored.commit_oid;

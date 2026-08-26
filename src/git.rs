@@ -406,11 +406,11 @@ mod tests {
         );
 
         repository
-            .write_onboarding_state("prod", &[8; 32], b"opaque-state")
+            .write_onboarding_state("prod", &[8; 32], b"pake-state")
             .unwrap();
         assert_eq!(
             repository.read_onboarding_state("prod", &[8; 32]).unwrap(),
-            b"opaque-state"
+            b"pake-state"
         );
         repository
             .delete_onboarding_state("prod", &[8; 32])

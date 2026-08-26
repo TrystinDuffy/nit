@@ -434,32 +434,32 @@ fn validate_membership_change(
                 .contains(&proposal.parent_trust_hash),
         "proposal does not prove signing-key possession in a trusted vault context"
     );
-    let response_event_hash = response_event_hash
-        .context("accepted proposal is an OPAQUE start, not a finalized proposal")?;
-    let response = state
-        .invitation_responses
-        .get(&response_event_hash)
-        .context("accepted proposal references an untrusted invitation response")?;
-    ensure!(
-        response.invitation_id == *invitation_id,
-        "proposal and invitation response IDs differ"
-    );
-    let start = events
-        .iter()
-        .find(|event| event.event_hash().ok() == Some(response.proposal_event_hash))
-        .context("invitation response proposal start is absent")?;
-    let EventPayload::ProposeUser {
-        identity: start_identity,
-        response_event_hash: None,
-        ..
-    } = &start.payload
-    else {
-        bail!("invitation response does not reference a proposal start");
-    };
-    ensure!(
-        start_identity == identity && start.author_signing_key == identity.signing_public_key,
-        "final proposal identity differs from its signed proposal start"
-    );
+    if let Some(response_event_hash) = response_event_hash {
+        let response = state
+            .invitation_responses
+            .get(response_event_hash)
+            .context("accepted legacy proposal references an untrusted invitation response")?;
+        ensure!(
+            response.invitation_id == *invitation_id,
+            "proposal and invitation response IDs differ"
+        );
+        let start = events
+            .iter()
+            .find(|event| event.event_hash().ok() == Some(response.proposal_event_hash))
+            .context("invitation response proposal start is absent")?;
+        let EventPayload::ProposeUser {
+            identity: start_identity,
+            response_event_hash: None,
+            ..
+        } = &start.payload
+        else {
+            bail!("invitation response does not reference a proposal start");
+        };
+        ensure!(
+            start_identity == identity && start.author_signing_key == identity.signing_public_key,
+            "final proposal identity differs from its signed proposal start"
+        );
+    }
     let invitation = state
         .active_invitations
         .get(invitation_id)
@@ -589,8 +589,11 @@ fn classify_inert_events(
                                         == authentication.invitation_event_hash
                                 },
                             )
-                            && response_event_hash
+                            && (response_event_hash
                                 .is_some_and(|hash| hash == authentication.response_event_hash)
+                                || response_event_hash.is_none()
+                                    && authentication.response_event_hash
+                                        == authentication.invitation_event_hash)
                             && authentication.signing_public_key == identity.signing_public_key
                             && authentication.encryption_public_key
                                 == identity.encryption_public_key

@@ -40,7 +40,7 @@ pub enum Command {
     Delete { key: String },
     /// List trusted members
     Members,
-    /// Create an OPAQUE invitation
+    /// Create a SPAKE2 invitation challenge
     Invite {
         #[arg(long, default_value_t = 30)]
         minutes: u64,
@@ -57,15 +57,7 @@ pub enum Command {
         #[arg(long)]
         phrase_stdin: bool,
     },
-    /// Finish the phrase proof after the owner sends its PAKE challenge
-    ContinueRequest {
-        proposal: String,
-        #[arg(long)]
-        phrase_stdin: bool,
-    },
-    /// Send the PAKE challenge for a new join request
-    Respond { proposal: String },
-    /// Admit a requester that completed the invitation phrase proof
+    /// Verify an invitation phrase proof and admit the requester
     Approve { proposal: String },
     /// Verify admission confirmation and checkpoint the new member
     ConfirmAccess { proposal: String },
