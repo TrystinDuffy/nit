@@ -40,6 +40,56 @@ pub fn discover_identities() -> Result<Vec<DiscoveredIdentity>> {
     Ok(identities)
 }
 
+pub fn choose_option(options: Vec<(String, String)>, purpose: &str) -> Result<String> {
+    ensure!(!options.is_empty(), "there are no options to select");
+    if options.len() == 1 {
+        return Ok(options.into_iter().next().expect("length checked").0);
+    }
+    require_terminal()?;
+    let mut selected = 0usize;
+    let selected = with_terminal(|terminal| loop {
+        terminal.draw(|frame| {
+            let areas = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(4), Constraint::Length(3)])
+                .split(frame.area());
+            let items = options
+                .iter()
+                .map(|(_, label)| ListItem::new(format!("  {label}")))
+                .collect::<Vec<_>>();
+            let list = List::new(items)
+                .block(Block::default().borders(Borders::ALL).title(purpose))
+                .highlight_symbol("› ")
+                .highlight_style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                );
+            let mut state = ListState::default();
+            state.select(Some(selected));
+            frame.render_stateful_widget(list, areas[0], &mut state);
+            frame.render_widget(
+                Paragraph::new(" <j>/<k> or <↑>/<↓> select   <Enter> confirms   <Esc> cancels")
+                    .block(Block::default().borders(Borders::ALL).title(" Keys ")),
+                areas[1],
+            );
+        })?;
+        let Some(input) = event_to_input()? else {
+            continue;
+        };
+        match input {
+            InputKey::Down | InputKey::Char('j') => {
+                selected = (selected + 1).min(options.len() - 1)
+            }
+            InputKey::Up | InputKey::Char('k') => selected = selected.saturating_sub(1),
+            InputKey::Enter => break Ok(selected),
+            InputKey::Esc | InputKey::Char('q') => bail!("selection cancelled"),
+            _ => {}
+        }
+    })?;
+    Ok(options[selected].0.clone())
+}
+
 pub fn choose_identity(
     identities: Vec<DiscoveredIdentity>,
     requested: Option<&str>,

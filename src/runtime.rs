@@ -17,7 +17,7 @@ use crate::{
     invitation::{self, ClientSessionState},
     state::{derive_trusted_state, DeriveOptions, TrustedState},
     terminal::{
-        choose_identity, discard_pending_input, discover_identities, event_to_input,
+        choose_identity, choose_option, discard_pending_input, discover_identities, event_to_input,
         identity_backend, prompt_line, require_terminal, with_terminal,
     },
     tui::{Effect, VaultUi},
@@ -861,28 +861,20 @@ fn run_interactive_existing(
         !state.active_invitations.is_empty(),
         "this identity is not trusted and the vault has no active invitation"
     );
-    let invitation_selector = if state.active_invitations.len() == 1 {
-        hex::encode_upper(
-            state
-                .active_invitations
-                .values()
-                .next()
-                .expect("length checked")
-                .invitation_id,
-        )
-    } else {
-        println!("Active invitations:");
-        for invitation in state.active_invitations.values() {
-            println!(
-                "  {}  expires {}",
-                hex::encode_upper(invitation.invitation_id),
-                invitation.expires_at
-            );
-        }
-        let value = prompt_line("Invitation ID: ")?;
-        ensure!(!value.is_empty(), "an invitation ID is required");
-        value
-    };
+    let invitation_selector = choose_option(
+        state
+            .active_invitations
+            .values()
+            .map(|invitation| {
+                let id = hex::encode_upper(invitation.invitation_id);
+                (
+                    id.clone(),
+                    format!("{id}  expires {}", invitation.expires_at),
+                )
+            })
+            .collect(),
+        "Select an invitation",
+    )?;
     let default_name = selected.display_name.clone();
     let entered_name = prompt_line(&format!("Member name [{default_name}]: "))?;
     let name = if entered_name.is_empty() {
