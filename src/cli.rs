@@ -72,6 +72,8 @@ pub enum Command {
         #[arg(value_enum)]
         role: CliRole,
     },
+    /// Irreversibly replace the selected hardware identity with keys requiring no PIN or touch
+    DestroyIdentity,
     /// Verify and summarize the trusted projection without unlocking values
     Verify,
     /// Fetch into refs/vault-remotes/<remote>/<vault>, verify, then CAS-advance
