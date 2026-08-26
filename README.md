@@ -78,14 +78,14 @@ Ordinary `Put` and `Delete` events use the current epoch key. They do not re-enc
 
 A membership transition creates a fresh epoch key and a fresh encrypted snapshot. A new member can decrypt the current logical state without receiving old epoch keys. A removed member receives no new key. Historical access cannot be revoked.
 
-Current roles are intentionally minimal:
+Capabilities are intentionally minimal:
 
 ```text
-reader
-owner
+member   read and write secrets
+owner    read and write secrets, plus manage invitations and membership
 ```
 
-V1 currently permits only owners to append trusted state changes.
+Every trusted member is a secret reader/writer. Multiple owners are supported. The internal `reader` role code is presented to users as `member` for compatibility with existing event encoding.
 
 ## Hardware identity
 
@@ -127,12 +127,13 @@ git vault prod set ENABLED --type boolean
 git vault prod set KEY_BYTES --type bytes
 git vault prod delete TOKEN
 git vault prod members
-git vault prod invite --minutes 30 --words 4
+git vault prod invite --minutes 30 --words 4 --capability member
+git vault prod invite --minutes 30 --words 4 --capability owner
 git vault prod request-access <invitation> --name Bob
 git vault prod approve <phrase-proof>
 git vault prod confirm-access <phrase-proof>
 git vault prod remove-member <name-or-fingerprint>
-git vault prod set-role <name-or-fingerprint> reader
+git vault prod set-role <name-or-fingerprint> member
 git vault prod verify
 ```
 
@@ -176,6 +177,8 @@ The user-visible exchange is:
 2. **Requester:** select the invitation, enter the phrase, and submit a signed phrase proof.
 3. **Owner:** verify that proof and sign the membership admission.
 4. **Requester:** automatically verify the exact admission epoch when it next opens the vault.
+
+The owner chooses `member` or `owner` capability when creating the invitation. That capability is signed into the invitation, bound into requester key confirmation, enforced by trusted replay, and covered by the requester's final admission confirmation.
 
 The owner's resumable SPAKE2 state, including the phrase, is encrypted under the current membership epoch key. The public Git transcript provides no passive offline phrase verifier. Requester session state lives only under `refs/vault-onboarding/*` and contains no phrase.
 

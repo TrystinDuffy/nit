@@ -10,7 +10,7 @@ use zeroize::Zeroize;
 
 use crate::{
     crypto::VaultValue,
-    event::EpochMember,
+    event::{EpochMember, Role},
     invitation,
     keys::InputKey,
     state::{InvitationState, PendingProposal},
@@ -25,7 +25,7 @@ pub enum Effect {
     Put { key: String, value: VaultValue },
     Delete { key: String },
     RemoveMember { signing_public_key: [u8; 32] },
-    CreateInvitation,
+    CreateInvitation { role: Role },
     CloseInvitation { invitation_id: [u8; 16] },
     ApproveProposal { proposal_event_hash: [u8; 32] },
     Output(String),
@@ -46,6 +46,7 @@ enum Mode {
         key: String,
     },
     Access,
+    InvitationCapability,
     ConfirmRemoveMember {
         signing_public_key: [u8; 32],
         name: String,
@@ -168,6 +169,22 @@ impl VaultUi {
                 _ => Effect::None,
             },
             Mode::Access => self.input_access(input),
+            Mode::InvitationCapability => match input {
+                InputKey::Char('m') | InputKey::Char('r') => {
+                    self.mode = Mode::Access;
+                    Effect::CreateInvitation { role: Role::Reader }
+                }
+                InputKey::Char('o') => {
+                    self.mode = Mode::Access;
+                    Effect::CreateInvitation { role: Role::Owner }
+                }
+                InputKey::Esc | InputKey::Char('q') => {
+                    self.mode = Mode::Access;
+                    self.status = "Invitation cancelled".into();
+                    Effect::None
+                }
+                _ => Effect::None,
+            },
             Mode::ConfirmRemoveMember {
                 signing_public_key,
                 name,
@@ -236,7 +253,10 @@ impl VaultUi {
                 Constraint::Length(3),
             ])
             .split(frame.area());
-        if matches!(self.mode, Mode::Access | Mode::ConfirmRemoveMember { .. }) {
+        if matches!(
+            self.mode,
+            Mode::Access | Mode::InvitationCapability | Mode::ConfirmRemoveMember { .. }
+        ) {
             self.draw_access(frame, repository, vault, &chunks);
         } else {
             self.draw_secrets(frame, repository, vault, &chunks);
@@ -341,7 +361,11 @@ impl VaultUi {
                 self.access_selected = self.access_selected.saturating_sub(1);
                 Effect::None
             }
-            InputKey::Char('n') => Effect::CreateInvitation,
+            InputKey::Char('n') => {
+                self.mode = Mode::InvitationCapability;
+                self.status = "Choose invitation capability".into();
+                Effect::None
+            }
             InputKey::Char('d') => {
                 let Some(member) = self.members.get(self.access_selected) else {
                     self.status = "Select a trusted member to remove".into();
@@ -485,7 +509,9 @@ impl VaultUi {
                 )
             }
             Mode::ConfirmDelete { key } => format!("Permanently delete {key}?"),
-            Mode::Access | Mode::ConfirmRemoveMember { .. } => unreachable!(),
+            Mode::Access | Mode::InvitationCapability | Mode::ConfirmRemoveMember { .. } => {
+                unreachable!()
+            }
         };
         frame.render_widget(
             Paragraph::new(detail)
@@ -505,15 +531,18 @@ impl VaultUi {
         let mut items = Vec::new();
         for member in &self.members {
             items.push(ListItem::new(format!(
-                "  trusted member  {}  {:?}  {}",
+                "  trusted member  {}  {}  {}",
                 member.identity.name,
-                member.role,
+                capability_label(member.role),
                 member.identity.fingerprint()
             )));
         }
         for invitation in &self.invitations {
             let protocol = if invitation::is_spake2_invitation(&invitation.pake_message) {
-                "SPAKE2"
+                invitation
+                    .invited_role
+                    .map(capability_label)
+                    .unwrap_or("SPAKE2")
             } else {
                 "obsolete PAKE — close"
             };
@@ -556,12 +585,23 @@ impl VaultUi {
             Mode::ConfirmRemoveMember { name, .. } => {
                 format!("Remove {name}, rotate the epoch key, and invalidate invitations?")
             }
+            Mode::InvitationCapability => {
+                "Invite as <m> member (read/write) or <o> owner (read/write + access management)?"
+                    .into()
+            }
             _ => self.access_detail(),
         };
         frame.render_widget(
             Paragraph::new(detail).block(Block::default().borders(Borders::ALL).title(" Details ")),
             chunks[1],
         );
+    }
+}
+
+fn capability_label(role: Role) -> &'static str {
+    match role {
+        Role::Reader => "member (read/write)",
+        Role::Owner => "owner (+ access management)",
     }
 }
 
@@ -592,7 +632,7 @@ impl Drop for VaultUi {
             }
             Mode::ConfirmDelete { key } => key.zeroize(),
             Mode::ConfirmRemoveMember { name, .. } => name.zeroize(),
-            Mode::Secrets | Mode::Access => {}
+            Mode::Secrets | Mode::Access | Mode::InvitationCapability => {}
         }
     }
 }
@@ -608,6 +648,31 @@ fn key_help(mode: &Mode) -> &'static str {
         Mode::Access => {
             "<j>/<k> select  <n> invite  <a> verify/admit  <c> close  <d> remove  <q>/<Esc> back"
         }
+        Mode::InvitationCapability => {
+            "<m> member (read/write)  <o> owner (+ access management)  <Esc> cancel"
+        }
         Mode::ConfirmRemoveMember { .. } => "<y>/<Enter> confirm  <n>/<Esc> cancel",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invitation_capability_is_chosen_before_creation() {
+        let mut ui = VaultUi::new(BTreeMap::new(), Vec::new(), Vec::new(), Vec::new());
+        assert!(matches!(ui.input(InputKey::Char('a')), Effect::None));
+        assert!(matches!(ui.input(InputKey::Char('n')), Effect::None));
+        assert!(matches!(
+            ui.input(InputKey::Char('o')),
+            Effect::CreateInvitation { role: Role::Owner }
+        ));
+
+        assert!(matches!(ui.input(InputKey::Char('n')), Effect::None));
+        assert!(matches!(
+            ui.input(InputKey::Char('m')),
+            Effect::CreateInvitation { role: Role::Reader }
+        ));
     }
 }

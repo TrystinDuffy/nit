@@ -46,6 +46,9 @@ pub enum Command {
         minutes: u64,
         #[arg(long, default_value_t = 4)]
         words: usize,
+        /// Member can read/write secrets; owner can also manage access
+        #[arg(long, value_enum, default_value_t = CliRole::Member)]
+        capability: CliRole,
     },
     /// Close an active invitation
     CloseInvitation { invitation: String },
@@ -63,7 +66,7 @@ pub enum Command {
     ConfirmAccess { proposal: String },
     /// Remove a trusted member and rotate the membership epoch
     RemoveMember { member: String },
-    /// Change a trusted member's role and rotate the membership epoch
+    /// Change a trusted member's capability and rotate the membership epoch
     SetRole {
         member: String,
         #[arg(value_enum)]
@@ -85,14 +88,15 @@ pub enum Command {
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum CliRole {
-    Reader,
+    #[value(alias = "reader")]
+    Member,
     Owner,
 }
 
 impl From<CliRole> for Role {
     fn from(value: CliRole) -> Self {
         match value {
-            CliRole::Reader => Self::Reader,
+            CliRole::Member => Self::Reader,
             CliRole::Owner => Self::Owner,
         }
     }

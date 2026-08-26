@@ -9,11 +9,11 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     crypto::{decrypt_protocol_state, encrypt_protocol_state, EpochKey, ProtocolStateContext},
-    event::{admission_binding_digest, Hash, MemberIdentity, MembershipEpoch, VaultId},
+    event::{admission_binding_digest, Hash, MemberIdentity, MembershipEpoch, Role, VaultId},
     state::{InvitationState, ProposalAuthentication},
 };
 
-const INVITATION_MAGIC: &[u8; 8] = b"GVSPKIN1";
+const INVITATION_MAGIC: &[u8; 8] = b"GVSPKIN2";
 const OWNER_STATE_MAGIC: &[u8; 8] = b"GVSPKOS1";
 const REPLY_MAGIC: &[u8; 8] = b"GVSPKRP1";
 const SESSION_STATE_MAGIC: &[u8; 8] = b"GVSPKSK1";
@@ -71,6 +71,7 @@ pub fn create_registration(
     parent_trust_hash: &Hash,
     invitation_id: &[u8; 16],
     phrase: &str,
+    invited_role: Role,
     epoch_key: &EpochKey,
 ) -> Result<Vec<u8>> {
     validate_phrase(phrase)?;
@@ -106,6 +107,7 @@ pub fn create_registration(
     seed.zeroize();
 
     let mut output = INVITATION_MAGIC.to_vec();
+    output.push(encode_role(invited_role));
     put_bytes(&mut output, &owner_message)?;
     output.extend_from_slice(&nonce);
     put_bytes(&mut output, &encrypted_owner_state)?;
@@ -147,6 +149,7 @@ pub fn start_proposal(
         identity,
         &requester_message,
         &record.owner_message,
+        record.invited_role,
     )?;
     let mut reply = REPLY_MAGIC.to_vec();
     put_bytes(&mut reply, &requester_message)?;
@@ -162,7 +165,7 @@ pub fn authenticate_proposal(
     reply: &[u8],
     proposal_identity: &MemberIdentity,
     epoch_key: &EpochKey,
-) -> Result<(ProposalAuthentication, Zeroizing<Vec<u8>>)> {
+) -> Result<(ProposalAuthentication, Zeroizing<Vec<u8>>, Role)> {
     let invitation_record = decode_invitation(&invitation.pake_message)?;
     let reply = decode_reply(reply)?;
     let owner_state = decrypt_protocol_state(
@@ -203,8 +206,8 @@ pub fn authenticate_proposal(
         vault_id,
         invitation,
         proposal_identity,
-        &reply.requester_message,
-        &invitation_record.owner_message,
+        (&reply.requester_message, &invitation_record.owner_message),
+        invitation_record.invited_role,
         &reply.confirmation,
     )?;
     Ok((
@@ -217,6 +220,7 @@ pub fn authenticate_proposal(
             encryption_public_key: proposal_identity.encryption_public_key,
         },
         session_key,
+        invitation_record.invited_role,
     ))
 }
 
@@ -279,6 +283,10 @@ pub fn is_spake2_invitation(bytes: &[u8]) -> bool {
     bytes.starts_with(INVITATION_MAGIC)
 }
 
+pub fn invited_role(bytes: &[u8]) -> Result<Role> {
+    Ok(decode_invitation(bytes)?.invited_role)
+}
+
 fn requester_confirmation(
     session_key: &[u8],
     vault_id: &VaultId,
@@ -286,6 +294,7 @@ fn requester_confirmation(
     identity: &MemberIdentity,
     requester_message: &[u8],
     owner_message: &[u8],
+    invited_role: Role,
 ) -> Result<Hash> {
     let mut mac = Hmac::<Sha256>::new_from_slice(session_key)
         .map_err(|_| anyhow::anyhow!("invalid SPAKE2 session key"))?;
@@ -297,6 +306,7 @@ fn requester_confirmation(
         identity,
         requester_message,
         owner_message,
+        invited_role,
     )?;
     Ok(mac.finalize().into_bytes().into())
 }
@@ -306,8 +316,8 @@ fn verify_requester_confirmation(
     vault_id: &VaultId,
     invitation: &InvitationState,
     identity: &MemberIdentity,
-    requester_message: &[u8],
-    owner_message: &[u8],
+    messages: (&[u8], &[u8]),
+    invited_role: Role,
     confirmation: &Hash,
 ) -> Result<()> {
     let mut mac = Hmac::<Sha256>::new_from_slice(session_key)
@@ -318,8 +328,9 @@ fn verify_requester_confirmation(
         vault_id,
         invitation,
         identity,
-        requester_message,
-        owner_message,
+        messages.0,
+        messages.1,
+        invited_role,
     )?;
     mac.verify_slice(confirmation)
         .context("invitation phrase is wrong or requester confirmation was substituted")
@@ -332,17 +343,34 @@ fn update_confirmation_binding(
     identity: &MemberIdentity,
     requester_message: &[u8],
     owner_message: &[u8],
+    invited_role: Role,
 ) -> Result<()> {
     mac.update(vault_id);
     mac.update(&invitation.invitation_id);
     mac.update(&invitation.create_event_hash);
     mac.update(&invitation.create_parent_trust_hash);
+    mac.update(&[encode_role(invited_role)]);
     put_mac_bytes(mac, identity.name.as_bytes())?;
     mac.update(&identity.signing_public_key);
     mac.update(&identity.encryption_public_key);
     put_mac_bytes(mac, &identity.certificate)?;
     put_mac_bytes(mac, requester_message)?;
     put_mac_bytes(mac, owner_message)
+}
+
+fn encode_role(role: Role) -> u8 {
+    match role {
+        Role::Reader => 1,
+        Role::Owner => 2,
+    }
+}
+
+fn decode_role(value: u8) -> Result<Role> {
+    match value {
+        1 => Ok(Role::Reader),
+        2 => Ok(Role::Owner),
+        _ => anyhow::bail!("invalid invitation capability {value}"),
+    }
 }
 
 fn spake_identities(
@@ -358,6 +386,7 @@ fn spake_identities(
 }
 
 struct InvitationRecord {
+    invited_role: Role,
     owner_message: Vec<u8>,
     state_nonce: [u8; 12],
     encrypted_owner_state: Vec<u8>,
@@ -370,6 +399,7 @@ fn decode_invitation(bytes: &[u8]) -> Result<InvitationRecord> {
         "invitation uses an unsupported PAKE protocol; close it and create a new invitation"
     );
     let record = InvitationRecord {
+        invited_role: decode_role(decoder.u8()?)?,
         owner_message: decoder.bytes(SPAKE_MESSAGE_SIZE, "SPAKE2 owner challenge")?,
         state_nonce: decoder.array()?,
         encrypted_owner_state: decoder.bytes(MAX_PAKE_FIELD, "encrypted SPAKE2 owner state")?,
@@ -465,6 +495,10 @@ impl<'a> Decoder<'a> {
         Ok(self.take(N)?.try_into().expect("length checked"))
     }
 
+    fn u8(&mut self) -> Result<u8> {
+        Ok(self.take(1)?[0])
+    }
+
     fn bytes(&mut self, limit: usize, field: &str) -> Result<Vec<u8>> {
         let length = u32::from_be_bytes(self.array()?) as usize;
         ensure!(length <= limit, "{field} is too large");
@@ -518,6 +552,7 @@ mod tests {
             expires_at: u64::MAX,
             create_event_hash: [4; 32],
             create_parent_trust_hash: [2; 32],
+            invited_role: Some(Role::Owner),
             pake_message,
         }
     }
@@ -527,15 +562,24 @@ mod tests {
         let vault_id = [1; 32];
         let epoch_key = random_epoch_key();
         let phrase = "abandon ability able about";
-        let record =
-            create_registration(&vault_id, 1, &[2; 32], &[3; 16], phrase, &epoch_key).unwrap();
+        let record = create_registration(
+            &vault_id,
+            1,
+            &[2; 32],
+            &[3; 16],
+            phrase,
+            Role::Owner,
+            &epoch_key,
+        )
+        .unwrap();
         let invitation = invitation(record);
         let proposed = identity();
         let (reply, requester_key) =
             start_proposal(&vault_id, &invitation, &proposed, phrase).unwrap();
-        let (_, owner_key) =
+        let (_, owner_key, invited_role) =
             authenticate_proposal(&vault_id, &invitation, &reply, &proposed, &epoch_key).unwrap();
         assert_eq!(&*requester_key, &*owner_key);
+        assert_eq!(invited_role, Role::Owner);
 
         let (wrong_reply, _) = start_proposal(
             &vault_id,

@@ -139,11 +139,20 @@ pub fn run(cli: Cli) -> Result<()> {
             print_members(&session.state);
             Ok(())
         }
-        Some(Command::Invite { minutes, words }) => {
+        Some(Command::Invite {
+            minutes,
+            words,
+            capability,
+        }) => {
             print_identity_hint(session.identity.as_ref(), IdentityOperation::Sign);
-            let (invitation_id, mut phrase) = session.create_invitation(minutes, words)?;
+            let (invitation_id, mut phrase) =
+                session.create_invitation(minutes, words, capability.into())?;
             println!("{}", phrase.as_str());
-            eprintln!("Invitation ID: {}", hex::encode_upper(invitation_id));
+            eprintln!(
+                "Invitation ID: {} ({})",
+                hex::encode_upper(invitation_id),
+                capability_name(capability.into())
+            );
             phrase.zeroize();
             Ok(())
         }
@@ -224,6 +233,7 @@ impl OpenVault {
         &mut self,
         minutes: u64,
         words: usize,
+        invited_role: Role,
     ) -> Result<([u8; 16], Zeroizing<String>)> {
         ensure!(
             (1..=10_080).contains(&minutes),
@@ -241,6 +251,7 @@ impl OpenVault {
             &self.state.current_trust_hash,
             &invitation_id,
             &phrase,
+            invited_role,
             &self.epoch_key,
         )?;
         self.append_payload(
@@ -274,7 +285,7 @@ impl OpenVault {
         let EventPayload::ProposeUser { pake_message, .. } = &event.payload else {
             unreachable!()
         };
-        let (_authentication, session_key) = invitation::authenticate_proposal(
+        let (_authentication, session_key, invited_role) = invitation::authenticate_proposal(
             &self.state.vault_id,
             invitation,
             pake_message,
@@ -299,7 +310,7 @@ impl OpenVault {
             .iter()
             .map(|member| (member.identity.clone(), member.role))
             .collect::<Vec<_>>();
-        members.push((proposal.identity.clone(), Role::Reader));
+        members.push((proposal.identity.clone(), invited_role));
         let members = members
             .into_iter()
             .map(|(identity, role)| {
@@ -431,11 +442,17 @@ impl OpenVault {
             self.state.fork.is_none(),
             "cannot append while a trusted fork is unresolved"
         );
+        let member = self
+            .state
+            .member_for_signing_key(&self.identity.identity().signing_public_key)
+            .context("the selected identity is not a trusted member")?;
+        let requires_owner = !matches!(
+            &payload,
+            EventPayload::Put { .. } | EventPayload::Delete { .. }
+        );
         ensure!(
-            self.state
-                .member_for_signing_key(&self.identity.identity().signing_public_key)
-                .is_some_and(|member| member.role == Role::Owner),
-            "the selected identity is not authorized to append this event type"
+            !requires_owner || member.role == Role::Owner,
+            "only an owner can manage membership and invitations"
         );
         let event = Event::unsigned(
             self.state.vault_id,
@@ -498,7 +515,7 @@ impl OpenVault {
                 Effect::Put { .. }
                     | Effect::Delete { .. }
                     | Effect::RemoveMember { .. }
-                    | Effect::CreateInvitation
+                    | Effect::CreateInvitation { .. }
                     | Effect::CloseInvitation { .. }
                     | Effect::ApproveProposal { .. }
             );
@@ -535,12 +552,13 @@ impl OpenVault {
                         }
                     }
                 }
-                Effect::CreateInvitation => match self.create_invitation(30, 4) {
+                Effect::CreateInvitation { role } => match self.create_invitation(30, 4, role) {
                     Ok((invitation_id, mut phrase)) => {
                         refresh_access_view(&mut app, &self.state);
                         app.set_status(format!(
-                            "Invitation {}: share this phrase with the requester: {}",
+                            "Invitation {} ({}) — share this phrase: {}",
                             hex::encode_upper(&invitation_id[..4]),
+                            capability_name(role),
                             phrase.as_str()
                         ));
                         phrase.zeroize();
@@ -680,7 +698,7 @@ fn run_interactive_existing(
                         &device.signing_public_key,
                         &device.encryption_public_key,
                     )
-                    .map(|member| format!("trusted {:?}", member.role))
+                    .map(|member| format!("trusted {}", capability_name(member.role)))
                     .unwrap_or_else(|| "not trusted; invitation onboarding available".into()),
                 IdentityState::Provisionable => {
                     "not provisioned; invitation onboarding available".into()
@@ -841,7 +859,7 @@ fn unlock_vault(
                         &device.signing_public_key,
                         &device.encryption_public_key,
                     )
-                    .map(|member| format!("trusted {:?}", member.role))
+                    .map(|member| format!("trusted {}", capability_name(member.role)))
                     .unwrap_or_else(|| "not trusted".into()),
                 IdentityState::Provisionable => "not provisioned; not trusted".into(),
                 IdentityState::Unavailable(_) => "unavailable; not trusted".into(),
@@ -1317,12 +1335,19 @@ fn select_member_index(members: &[EpochMember], selector: &str) -> Result<usize>
     }
 }
 
+fn capability_name(role: Role) -> &'static str {
+    match role {
+        Role::Reader => "member: read/write",
+        Role::Owner => "owner: read/write + access management",
+    }
+}
+
 fn print_members(state: &TrustedState) {
     for member in &state.members {
         println!(
-            "{}  {:?}  {}",
+            "{}  {}  {}",
             member.identity.fingerprint(),
-            member.role,
+            capability_name(member.role),
             member.identity.name
         );
     }
@@ -1518,7 +1543,7 @@ mod integration_tests {
             epoch_key,
             identity: alice,
         };
-        let (_, phrase) = vault.create_invitation(30, 4).unwrap();
+        let (_, phrase) = vault.create_invitation(30, 4, Role::Owner).unwrap();
         let invitation = vault
             .state
             .active_invitations
@@ -1575,13 +1600,16 @@ mod integration_tests {
             .approve_proposal(&hex::encode_upper(final_hash))
             .unwrap();
         assert_eq!(vault.state.members.len(), 2);
-        assert!(vault
-            .state
-            .member_for_public_keys(
-                &bob_device.signing_public_key,
-                &bob_device.encryption_public_key
-            )
-            .is_some());
+        assert_eq!(
+            vault
+                .state
+                .member_for_public_keys(
+                    &bob_device.signing_public_key,
+                    &bob_device.encryption_public_key
+                )
+                .map(|member| member.role),
+            Some(Role::Owner)
+        );
         let admission = vault
             .log
             .events

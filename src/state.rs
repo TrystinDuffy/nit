@@ -14,6 +14,7 @@ use crate::{
 
 const GENESIS_TRUST_DOMAIN: &[u8] = b"git-vault/trust-genesis/v1";
 const TRUST_DOMAIN: &[u8] = b"git-vault/trust/v1";
+const SPAKE2_INVITATION_MAGIC: &[u8; 8] = b"GVSPKIN2";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ValidationLevel {
@@ -29,6 +30,7 @@ pub struct InvitationState {
     pub expires_at: u64,
     pub create_event_hash: Hash,
     pub create_parent_trust_hash: Hash,
+    pub invited_role: Option<Role>,
     pub pake_message: Vec<u8>,
 }
 
@@ -294,9 +296,12 @@ fn validate_transition(
     let author = state
         .member_for_signing_key(&event.author_signing_key)
         .context("event author is not a current member")?;
-    ensure!(author.role == Role::Owner, "event author is not an owner");
     match &event.payload {
         EventPayload::MembershipEpoch(epoch) => {
+            ensure!(
+                author.role == Role::Owner,
+                "membership changes require an owner"
+            );
             ensure!(
                 epoch.epoch_number == state.membership_epoch + 1,
                 "membership epoch does not increment by one"
@@ -315,6 +320,10 @@ fn validate_transition(
             ..
         } => {
             ensure!(
+                author.role == Role::Owner,
+                "creating invitations requires an owner"
+            );
+            ensure!(
                 *epoch_number == state.membership_epoch,
                 "invitation targets a stale membership epoch"
             );
@@ -327,16 +336,26 @@ fn validate_transition(
                 "invitation ID is already active"
             );
         }
-        EventPayload::CloseInvitation { invitation_id } => ensure!(
-            state.active_invitations.contains_key(invitation_id),
-            "invitation is not active"
-        ),
+        EventPayload::CloseInvitation { invitation_id } => {
+            ensure!(
+                author.role == Role::Owner,
+                "closing invitations requires an owner"
+            );
+            ensure!(
+                state.active_invitations.contains_key(invitation_id),
+                "invitation is not active"
+            );
+        }
         EventPayload::InvitationResponse {
             epoch_number,
             invitation_id,
             proposal_event_hash,
             ..
         } => {
+            ensure!(
+                author.role == Role::Owner,
+                "invitation responses require an owner"
+            );
             ensure!(
                 *epoch_number == state.membership_epoch,
                 "invitation response targets a stale membership epoch"
@@ -485,6 +504,14 @@ fn validate_membership_change(
         admitted.identity == *identity,
         "membership identity does not exactly match the immutable proposal"
     );
+    if response_event_hash.is_none() {
+        if let Some(invited_role) = invitation.invited_role {
+            ensure!(
+                admitted.role == invited_role,
+                "admitted capability does not match the owner-signed invitation"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -516,6 +543,7 @@ fn apply_trusted_event(state: &mut TrustedState, event: &Event, event_hash: &Has
                     expires_at: *expires_at,
                     create_event_hash: *event_hash,
                     create_parent_trust_hash: event.parent_trust_hash,
+                    invited_role: invited_role_from_message(pake_message),
                     pake_message: pake_message.clone(),
                 },
             );
@@ -633,6 +661,17 @@ fn classify_inert_events(
         .pending_proposals
         .sort_by_key(|proposal| proposal.event_hash);
     Ok(())
+}
+
+fn invited_role_from_message(message: &[u8]) -> Option<Role> {
+    if message.get(..8) != Some(SPAKE2_INVITATION_MAGIC.as_slice()) {
+        return None;
+    }
+    match message.get(8) {
+        Some(1) => Some(Role::Reader),
+        Some(2) => Some(Role::Owner),
+        _ => None,
+    }
 }
 
 fn validate_checkpoints(state: &TrustedState, options: &DeriveOptions) -> Result<()> {
@@ -809,6 +848,41 @@ mod tests {
             authorized.event_hash().unwrap()
         );
         assert!(state.fork.is_none());
+    }
+
+    #[test]
+    fn non_owner_member_can_append_secret_changes() {
+        let mut alice = identity(21, "Alice");
+        let mut bob = identity(22, "Bob");
+        let key = random_epoch_key();
+        let first_epoch = epoch(1, &[(&alice, Role::Owner), (&bob, Role::Reader)], &key);
+        let genesis = sign_event(&mut alice, [0; 32], EventPayload::Genesis(first_epoch));
+        let parent = trust_after(&genesis);
+        let edit = sign_event(
+            &mut bob,
+            parent,
+            EventPayload::Delete {
+                epoch_number: 1,
+                key: "SHARED".into(),
+            },
+        );
+        let unauthorized_invitation = sign_event(
+            &mut bob,
+            parent,
+            EventPayload::CreateInvitation {
+                epoch_number: 1,
+                invitation_id: [23; 16],
+                expires_at: u64::MAX,
+                pake_message: vec![1],
+            },
+        );
+        let state = derive_trusted_state(
+            &[genesis, unauthorized_invitation, edit.clone()],
+            &DeriveOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(state.trusted_event_hashes.len(), 2);
+        assert_eq!(state.trusted_event_hashes[1], edit.event_hash().unwrap());
     }
 
     #[test]

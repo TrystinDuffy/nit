@@ -39,6 +39,7 @@ Requester HMAC confirmation additionally binds:
 
 - trusted invitation event hash;
 - complete proposed Ed25519/X25519 identity;
+- owner-selected `member` or `owner` capability;
 - both SPAKE2 messages.
 
 The owner admission HMAC binds:
