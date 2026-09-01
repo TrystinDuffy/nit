@@ -23,9 +23,7 @@ use crate::{
 const WRAP_KDF_DOMAIN: &[u8] = b"git-vault/epoch-wrap-kdf/v1";
 const WRAP_AAD_DOMAIN: &[u8] = b"git-vault/epoch-wrap-aad/v1";
 const SNAPSHOT_AAD_DOMAIN: &[u8] = b"git-vault/snapshot-aad/v1";
-const PUT_AAD_DOMAIN: &[u8] = b"git-vault/put-aad/v1";
 const MUTATION_AAD_DOMAIN: &[u8] = b"git-vault/mutation-aad/v1";
-const PROTOCOL_STATE_AAD_DOMAIN: &[u8] = b"git-vault/protocol-state-aad/v1";
 const SNAPSHOT_MAGIC: &[u8; 8] = b"GVSNP001";
 const MUTATION_MAGIC: &[u8; 8] = b"GVMUT001";
 
@@ -229,87 +227,6 @@ pub fn decrypt_snapshot(
     Ok(values)
 }
 
-pub struct ProtocolStateContext<'a> {
-    pub vault_id: &'a VaultId,
-    pub epoch_number: u64,
-    pub invitation_id: &'a [u8; 16],
-    pub reference_hash: &'a [u8; 32],
-    pub purpose: &'a [u8],
-}
-
-pub fn encrypt_protocol_state(
-    context: &ProtocolStateContext<'_>,
-    plaintext: &[u8],
-    epoch_key: &[u8; 32],
-) -> Result<([u8; 12], Vec<u8>)> {
-    ensure!(plaintext.len() <= 256 * 1024, "protocol state is too large");
-    let mut nonce = [0u8; 12];
-    OsRng.fill_bytes(&mut nonce);
-    let aad = protocol_state_aad(context);
-    Ok((nonce, encrypt(epoch_key, &nonce, plaintext, &aad)?))
-}
-
-pub fn decrypt_protocol_state(
-    context: &ProtocolStateContext<'_>,
-    nonce: &[u8; 12],
-    ciphertext: &[u8],
-    epoch_key: &[u8; 32],
-) -> Result<Zeroizing<Vec<u8>>> {
-    ensure!(
-        ciphertext.len() <= 256 * 1024 + 16,
-        "protocol state is too large"
-    );
-    Ok(Zeroizing::new(
-        decrypt(epoch_key, nonce, ciphertext, &protocol_state_aad(context))
-            .context("cannot decrypt invitation protocol state")?,
-    ))
-}
-
-pub fn encrypt_put(
-    vault_id: &VaultId,
-    epoch_number: u64,
-    key: &str,
-    value: &VaultValue,
-    epoch_key: &[u8; 32],
-) -> Result<([u8; 12], Vec<u8>)> {
-    ensure!(
-        !key.is_empty() && key.len() <= MAX_KEY_LEN,
-        "invalid secret key"
-    );
-    let mut plaintext = Zeroizing::new(value.as_bytes());
-    ensure!(
-        plaintext.len() <= MAX_VALUE_SIZE,
-        "secret value is too large"
-    );
-    let mut nonce = [0u8; 12];
-    OsRng.fill_bytes(&mut nonce);
-    let aad = put_aad(vault_id, epoch_number, key, value.value_type());
-    let ciphertext = encrypt(epoch_key, &nonce, &plaintext, &aad)?;
-    plaintext.zeroize();
-    Ok((nonce, ciphertext))
-}
-
-pub fn decrypt_put(
-    vault_id: &VaultId,
-    epoch_number: u64,
-    key: &str,
-    value_type: ValueType,
-    nonce: &[u8; 12],
-    ciphertext: &[u8],
-    epoch_key: &[u8; 32],
-) -> Result<VaultValue> {
-    let mut plaintext = decrypt(
-        epoch_key,
-        nonce,
-        ciphertext,
-        &put_aad(vault_id, epoch_number, key, value_type),
-    )
-    .context("cannot decrypt trusted Put event")?;
-    let value = VaultValue::from_bytes(value_type, std::mem::take(&mut plaintext))?;
-    plaintext.zeroize();
-    Ok(value)
-}
-
 pub fn encrypt_mutation(
     vault_id: &VaultId,
     epoch_number: u64,
@@ -497,39 +414,11 @@ fn snapshot_aad(vault_id: &VaultId, epoch_number: u64) -> Vec<u8> {
     aad
 }
 
-fn protocol_state_aad(context: &ProtocolStateContext<'_>) -> Vec<u8> {
-    let mut aad = Vec::new();
-    aad.extend_from_slice(PROTOCOL_STATE_AAD_DOMAIN);
-    aad.extend_from_slice(context.vault_id);
-    aad.extend_from_slice(&context.epoch_number.to_be_bytes());
-    aad.extend_from_slice(context.invitation_id);
-    aad.extend_from_slice(context.reference_hash);
-    aad.extend_from_slice(&(context.purpose.len() as u32).to_be_bytes());
-    aad.extend_from_slice(context.purpose);
-    aad
-}
-
 fn mutation_aad(vault_id: &VaultId, epoch_number: u64) -> Vec<u8> {
     let mut aad = Vec::new();
     aad.extend_from_slice(MUTATION_AAD_DOMAIN);
     aad.extend_from_slice(vault_id);
     aad.extend_from_slice(&epoch_number.to_be_bytes());
-    aad
-}
-
-fn put_aad(vault_id: &VaultId, epoch_number: u64, key: &str, value_type: ValueType) -> Vec<u8> {
-    let mut aad = Vec::new();
-    aad.extend_from_slice(PUT_AAD_DOMAIN);
-    aad.extend_from_slice(vault_id);
-    aad.extend_from_slice(&epoch_number.to_be_bytes());
-    aad.push(match value_type {
-        ValueType::Text => 1,
-        ValueType::Number => 2,
-        ValueType::Boolean => 3,
-        ValueType::Bytes => 4,
-    });
-    aad.extend_from_slice(&(key.len() as u32).to_be_bytes());
-    aad.extend_from_slice(key.as_bytes());
     aad
 }
 
@@ -673,7 +562,7 @@ impl<'a> SnapshotDecoder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identity::DeviceIdentity;
+    use crate::identity::{DeviceIdentity, IdentityBackend};
 
     struct SoftwareSession {
         identity: DeviceIdentity,
@@ -709,7 +598,7 @@ mod tests {
             encryption_public_key,
         };
         let device = DeviceIdentity {
-            backend: "test".into(),
+            backend: IdentityBackend::TouchId,
             locator: "alice".into(),
             display_name: "Alice".into(),
             encryption_public_key,

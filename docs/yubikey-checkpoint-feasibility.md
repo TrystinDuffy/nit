@@ -27,9 +27,9 @@ After writing, `git-vault` rereads and canonically decodes the object. A mismatc
 After verifying a vault against any existing hardware record, the client compares the newest trusted membership epoch with the device checkpoint. Before treating a newer epoch as accepted, it must persist and reread the new checkpoint. This applies to:
 
 - vault creation;
-- owner admission/removal/capability changes;
-- ordinary members observing a membership transition created elsewhere;
-- requester admission confirmation.
+- owner additions/removals/capability changes;
+- the newly added key during physical-presence onboarding;
+- ordinary members observing a membership transition created elsewhere.
 
 A failed update is a hard, prominent error rather than a silently ignored warning.
 

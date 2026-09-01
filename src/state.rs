@@ -5,42 +5,12 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     crypto::{decrypt_mutation, decrypt_snapshot, DecryptedMutation, EpochKey, VaultValue},
-    event::{
-        EpochMember, Event, EventPayload, Hash, MemberIdentity, MembershipEpoch, Role, VaultId,
-        MAX_INVITATIONS, MAX_PROPOSALS,
-    },
+    event::{EpochMember, Event, EventPayload, Hash, MembershipEpoch, Role, VaultId},
     identity::VaultTrustRecord,
 };
 
 const GENESIS_TRUST_DOMAIN: &[u8] = b"git-vault/trust-genesis/v1";
 const TRUST_DOMAIN: &[u8] = b"git-vault/trust/v1";
-const SPAKE2_INVITATION_MAGIC: &[u8; 8] = b"GVSPKIN3";
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ValidationLevel {
-    StructurallyValid,
-    TrustedEvent,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InvitationState {
-    pub epoch_number: u64,
-    pub invitation_id: [u8; 16],
-    pub expires_at: u64,
-    pub create_event_hash: Hash,
-    pub create_parent_trust_hash: Hash,
-    pub creator_signing_key: [u8; 32],
-    pub invited_role: Option<Role>,
-    pub pake_message: Vec<u8>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PendingProposal {
-    pub event_hash: Hash,
-    pub invitation_id: [u8; 16],
-    pub identity: MemberIdentity,
-    pub validation: ValidationLevel,
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ForkState {
@@ -60,13 +30,10 @@ pub struct TrustedState {
     pub current_trust_hash: Hash,
     pub membership_epoch: u64,
     pub members: Vec<EpochMember>,
-    pub active_invitations: BTreeMap<[u8; 16], InvitationState>,
-    pub pending_proposals: Vec<PendingProposal>,
     pub fork: Option<ForkState>,
     pub diagnostics: Vec<String>,
     pub trusted_event_hashes: Vec<Hash>,
     pub membership_event_hash: Hash,
-    pub validation: ValidationLevel,
     trusted_context_hashes: BTreeSet<Hash>,
     epoch: MembershipEpoch,
     epoch_deltas: Vec<EventPayload>,
@@ -190,21 +157,17 @@ pub fn derive_trusted_state(events: &[Event], options: &DeriveOptions) -> Result
     let genesis_hash = genesis.verified_event_hash()?;
     let current_trust_hash = genesis_trust_hash(&genesis_hash);
     let mut trusted_hashes = BTreeSet::from([genesis_hash]);
-    let mut trusted_contexts = BTreeSet::from([current_trust_hash]);
     let mut membership_history = BTreeMap::from([(1, (genesis_hash, current_trust_hash))]);
     let mut state = TrustedState {
         vault_id: genesis.vault_id,
         current_trust_hash,
         membership_epoch: 1,
         members: epoch.members.clone(),
-        active_invitations: BTreeMap::new(),
-        pending_proposals: Vec::new(),
         fork: None,
         diagnostics: Vec::new(),
         trusted_event_hashes: vec![genesis_hash],
         membership_event_hash: genesis_hash,
-        validation: ValidationLevel::TrustedEvent,
-        trusted_context_hashes: trusted_contexts.clone(),
+        trusted_context_hashes: BTreeSet::from([current_trust_hash]),
         epoch: epoch.clone(),
         epoch_deltas: Vec::new(),
         membership_history: membership_history.clone(),
@@ -217,13 +180,10 @@ pub fn derive_trusted_state(events: &[Event], options: &DeriveOptions) -> Result
             .into_iter()
             .flatten()
         {
-            if trusted_hashes.contains(event_hash)
-                || event.vault_id != state.vault_id
-                || !event.payload.is_trust_state_changing()
-            {
+            if trusted_hashes.contains(event_hash) || event.vault_id != state.vault_id {
                 continue;
             }
-            if validate_transition(event, &state, &events_by_hash, options).is_ok() {
+            if validate_transition(event, &state).is_ok() {
                 candidates.push((*event_hash, *event));
             }
         }
@@ -246,7 +206,6 @@ pub fn derive_trusted_state(events: &[Event], options: &DeriveOptions) -> Result
         apply_trusted_event(&mut state, event, &event_hash)?;
         state.current_trust_hash = advance_trust_hash(&state.current_trust_hash, &event_hash);
         trusted_hashes.insert(event_hash);
-        trusted_contexts.insert(state.current_trust_hash);
         state
             .trusted_context_hashes
             .insert(state.current_trust_hash);
@@ -260,22 +219,12 @@ pub fn derive_trusted_state(events: &[Event], options: &DeriveOptions) -> Result
         }
     }
 
-    classify_inert_events(
-        &mut state,
-        &events_by_hash,
-        &trusted_hashes,
-        &trusted_contexts,
-    )?;
+    classify_inert_events(&mut state, &events_by_hash, &trusted_hashes);
     validate_checkpoints(&state, options)?;
     Ok(state)
 }
 
-fn validate_transition(
-    event: &Event,
-    state: &TrustedState,
-    events_by_hash: &BTreeMap<Hash, &Event>,
-    options: &DeriveOptions,
-) -> Result<()> {
+fn validate_transition(event: &Event, state: &TrustedState) -> Result<()> {
     let author = state
         .member_for_signing_key(&event.author_signing_key)
         .context("event author is not a current member")?;
@@ -289,13 +238,6 @@ fn validate_transition(
                 epoch.epoch_number == state.membership_epoch + 1,
                 "membership epoch does not increment by one"
             );
-            validate_membership_change(
-                epoch,
-                state,
-                events_by_hash,
-                options,
-                &event.author_signing_key,
-            )?;
         }
         EventPayload::Mutation { epoch_number, .. } => {
             ensure!(
@@ -303,123 +245,7 @@ fn validate_transition(
                 "value event targets a stale membership epoch"
             );
         }
-        EventPayload::CreateInvitation {
-            epoch_number,
-            invitation_id,
-            ..
-        } => {
-            ensure!(
-                author.role == Role::Owner,
-                "creating invitations requires an owner"
-            );
-            ensure!(
-                *epoch_number == state.membership_epoch,
-                "invitation targets a stale membership epoch"
-            );
-            ensure!(
-                state.active_invitations.len() < MAX_INVITATIONS,
-                "too many active invitations"
-            );
-            ensure!(
-                !state.active_invitations.contains_key(invitation_id),
-                "invitation ID is already active"
-            );
-        }
-        EventPayload::CloseInvitation { invitation_id } => {
-            ensure!(
-                author.role == Role::Owner,
-                "closing invitations requires an owner"
-            );
-            ensure!(
-                state.active_invitations.contains_key(invitation_id),
-                "invitation is not active"
-            );
-        }
-        EventPayload::Genesis(_)
-        | EventPayload::JoinProposal { .. }
-        | EventPayload::Unknown { .. } => bail!("event type cannot extend trusted state"),
-    }
-    Ok(())
-}
-
-fn validate_membership_change(
-    epoch: &MembershipEpoch,
-    state: &TrustedState,
-    events_by_hash: &BTreeMap<Hash, &Event>,
-    _options: &DeriveOptions,
-    admission_author: &[u8; 32],
-) -> Result<()> {
-    let old_keys = state
-        .members
-        .iter()
-        .map(|member| member.identity.signing_public_key)
-        .collect::<BTreeSet<_>>();
-    let new_keys = epoch
-        .members
-        .iter()
-        .map(|member| member.identity.signing_public_key)
-        .collect::<BTreeSet<_>>();
-    let added = new_keys.difference(&old_keys).copied().collect::<Vec<_>>();
-    if added.is_empty() {
-        ensure!(
-            epoch.accepted_proposal.is_none(),
-            "membership event references a proposal but adds no member"
-        );
-        return Ok(());
-    }
-    ensure!(added.len() == 1, "V1 admits at most one member per epoch");
-    let proposal_hash = epoch
-        .accepted_proposal
-        .context("new member requires an accepted proposal hash")?;
-    let proposal = events_by_hash
-        .get(&proposal_hash)
-        .copied()
-        .context("accepted proposal event is absent")?;
-    let EventPayload::JoinProposal {
-        invitation_id,
-        identity,
-        ..
-    } = &proposal.payload
-    else {
-        bail!("accepted event is not a user proposal");
-    };
-    ensure!(
-        proposal.author_signing_key == identity.signing_public_key
-            && state
-                .trusted_context_hashes
-                .contains(&proposal.parent_trust_hash),
-        "proposal does not prove signing-key possession in a trusted vault context"
-    );
-    let invitation = state
-        .active_invitations
-        .get(invitation_id)
-        .context("accepted proposal does not reference an active invitation")?;
-    ensure!(
-        epoch.admission_confirmation.is_some(),
-        "admission event lacks requester key confirmation"
-    );
-    ensure!(
-        identity.signing_public_key == added[0],
-        "membership event adds a different identity than the accepted proposal"
-    );
-    let admitted = epoch
-        .members
-        .iter()
-        .find(|member| member.identity.signing_public_key == added[0])
-        .unwrap();
-    ensure!(
-        admitted.identity == *identity,
-        "membership identity does not exactly match the immutable proposal"
-    );
-    ensure!(
-        invitation.creator_signing_key == *admission_author,
-        "only the invitation creator can admit its phrase proof"
-    );
-    if let Some(invited_role) = invitation.invited_role {
-        ensure!(
-            admitted.role == invited_role,
-            "admitted capability does not match the owner-signed invitation"
-        );
+        EventPayload::Genesis(_) => bail!("event type cannot extend trusted state"),
     }
     Ok(())
 }
@@ -431,34 +257,10 @@ fn apply_trusted_event(state: &mut TrustedState, event: &Event, event_hash: &Has
             state.members = epoch.members.clone();
             state.epoch = epoch.clone();
             state.epoch_deltas.clear();
-            state.active_invitations.clear();
             state.membership_event_hash = *event_hash;
         }
         EventPayload::Mutation { .. } => {
             state.epoch_deltas.push(event.payload.clone());
-        }
-        EventPayload::CreateInvitation {
-            epoch_number,
-            invitation_id,
-            expires_at,
-            pake_message,
-        } => {
-            state.active_invitations.insert(
-                *invitation_id,
-                InvitationState {
-                    epoch_number: *epoch_number,
-                    invitation_id: *invitation_id,
-                    expires_at: *expires_at,
-                    create_event_hash: *event_hash,
-                    create_parent_trust_hash: event.parent_trust_hash,
-                    creator_signing_key: event.author_signing_key,
-                    invited_role: invited_role_from_message(pake_message),
-                    pake_message: pake_message.clone(),
-                },
-            );
-        }
-        EventPayload::CloseInvitation { invitation_id } => {
-            state.active_invitations.remove(invitation_id);
         }
         _ => bail!("cannot apply inert event as trusted"),
     }
@@ -469,39 +271,13 @@ fn classify_inert_events(
     state: &mut TrustedState,
     events_by_hash: &BTreeMap<Hash, &Event>,
     trusted_hashes: &BTreeSet<Hash>,
-    trusted_contexts: &BTreeSet<Hash>,
-) -> Result<()> {
+) {
     for (hash, event) in events_by_hash {
         let hash = *hash;
         if trusted_hashes.contains(&hash) {
             continue;
         }
         match &event.payload {
-            EventPayload::JoinProposal {
-                invitation_id,
-                identity,
-                ..
-            } if event.vault_id == state.vault_id
-                && event.author_signing_key == identity.signing_public_key
-                && trusted_contexts.contains(&event.parent_trust_hash)
-                && state.active_invitations.contains_key(invitation_id) =>
-            {
-                if state.pending_proposals.len() >= MAX_PROPOSALS {
-                    state
-                        .diagnostics
-                        .push("additional user proposal ignored: proposal limit reached".into());
-                    continue;
-                }
-                state.pending_proposals.push(PendingProposal {
-                    event_hash: hash,
-                    invitation_id: *invitation_id,
-                    identity: identity.clone(),
-                    validation: ValidationLevel::StructurallyValid,
-                });
-            }
-            EventPayload::Unknown { type_code, .. } => state
-                .diagnostics
-                .push(format!("unknown event type {type_code} is inert")),
             EventPayload::Genesis(_) => state
                 .diagnostics
                 .push("additional Genesis event is inert".into()),
@@ -510,21 +286,6 @@ fn classify_inert_events(
                 hex::encode_upper(&hash[..8])
             )),
         }
-    }
-    state
-        .pending_proposals
-        .sort_by_key(|proposal| proposal.event_hash);
-    Ok(())
-}
-
-fn invited_role_from_message(message: &[u8]) -> Option<Role> {
-    if message.get(..8) != Some(SPAKE2_INVITATION_MAGIC.as_slice()) {
-        return None;
-    }
-    match message.get(8) {
-        Some(1) => Some(Role::Reader),
-        Some(2) => Some(Role::Owner),
-        _ => None,
     }
 }
 
@@ -581,8 +342,8 @@ mod tests {
     use super::*;
     use crate::{
         crypto::{encrypt_snapshot, random_epoch_key, wrap_epoch_key},
-        event::{EncryptedSnapshot, EventPayload, WrappedEpochKey},
-        identity::{DeviceIdentity, IdentitySession},
+        event::{EventPayload, MemberIdentity},
+        identity::{DeviceIdentity, IdentityBackend, IdentitySession},
     };
 
     struct TestIdentity {
@@ -612,7 +373,7 @@ mod tests {
         let signing = SigningKey::from_bytes(&[seed; 32]);
         let encryption = StaticSecret::from([seed.wrapping_add(64); 32]);
         let device = DeviceIdentity {
-            backend: "test".into(),
+            backend: IdentityBackend::TouchId,
             locator: name.into(),
             display_name: name.into(),
             encryption_public_key: PublicKey::from(&encryption).to_bytes(),
@@ -646,8 +407,6 @@ mod tests {
                 .map(|(identity, role)| member(identity, *role, key, number))
                 .collect(),
             snapshot: encrypt_snapshot(&[1; 32], number, &BTreeMap::new(), key).unwrap(),
-            accepted_proposal: None,
-            admission_confirmation: None,
         }
     }
 
@@ -701,25 +460,12 @@ mod tests {
         let mut alice = identity(21, "Alice");
         let mut bob = identity(22, "Bob");
         let key = random_epoch_key();
-        let first_epoch = epoch(1, &[(&alice, Role::Owner), (&bob, Role::Reader)], &key);
+        let first_epoch = epoch(1, &[(&alice, Role::Owner), (&bob, Role::Member)], &key);
         let genesis = sign_event(&mut alice, [0; 32], EventPayload::Genesis(first_epoch));
         let parent = trust_after(&genesis);
         let edit = sign_event(&mut bob, parent, mutation(1, 3));
-        let unauthorized_invitation = sign_event(
-            &mut bob,
-            parent,
-            EventPayload::CreateInvitation {
-                epoch_number: 1,
-                invitation_id: [23; 16],
-                expires_at: u64::MAX,
-                pake_message: vec![1],
-            },
-        );
-        let state = derive_trusted_state(
-            &[genesis, unauthorized_invitation, edit.clone()],
-            &DeriveOptions::default(),
-        )
-        .unwrap();
+        let state =
+            derive_trusted_state(&[genesis, edit.clone()], &DeriveOptions::default()).unwrap();
         assert_eq!(state.trusted_event_hashes.len(), 2);
         assert_eq!(state.trusted_event_hashes[1], edit.event_hash().unwrap());
     }
@@ -782,96 +528,40 @@ mod tests {
     }
 
     #[test]
-    fn admission_remains_trusted_after_invitation_expiry() {
+    fn owner_can_add_a_member_in_one_epoch() {
         let mut alice = identity(6, "Alice");
         let mut bob = identity(7, "Bob");
         let key1 = random_epoch_key();
         let genesis = genesis(&mut alice, &key1);
         let h1 = trust_after(&genesis);
-        let invitation = sign_event(
-            &mut alice,
-            h1,
-            EventPayload::CreateInvitation {
-                epoch_number: 1,
-                invitation_id: [8; 16],
-                expires_at: 1,
-                pake_message: vec![9],
-            },
-        );
-        let invitation_hash = invitation.event_hash().unwrap();
-        let invitation_trust_hash = advance_trust_hash(&h1, &invitation_hash);
-        let bob_identity = MemberIdentity {
-            name: "Bob".into(),
-            signing_public_key: bob.device.signing_public_key,
-            encryption_public_key: bob.device.encryption_public_key,
-        };
-        let proposal = sign_event(
-            &mut bob,
-            invitation_trust_hash,
-            EventPayload::JoinProposal {
-                invitation_id: [8; 16],
-                identity: bob_identity,
-                pake_message: vec![1],
-            },
-        );
-        let proposal_hash = proposal.event_hash().unwrap();
         let key2 = random_epoch_key();
-        let mut second_epoch = epoch(2, &[(&alice, Role::Owner), (&bob, Role::Owner)], &key2);
-        second_epoch.accepted_proposal = Some(proposal_hash);
-        second_epoch.admission_confirmation = Some([10; 32]);
-        let admit = sign_event(
-            &mut alice,
-            invitation_trust_hash,
-            EventPayload::MembershipEpoch(second_epoch),
-        );
-        let h2 = advance_trust_hash(&invitation_trust_hash, &admit.event_hash().unwrap());
-        let bob_event = sign_event(
-            &mut bob,
-            h2,
-            EventPayload::Mutation {
-                epoch_number: 2,
-                nonce: [11; 12],
-                ciphertext: vec![12; 16],
-            },
-        );
-        let state = derive_trusted_state(
-            &[genesis, invitation, proposal, admit, bob_event],
-            &DeriveOptions::default(),
-        )
-        .unwrap();
-        assert_eq!(state.trusted_event_hashes.len(), 4);
+        let second_epoch = epoch(2, &[(&alice, Role::Owner), (&bob, Role::Owner)], &key2);
+        let admit = sign_event(&mut alice, h1, EventPayload::MembershipEpoch(second_epoch));
+        let h2 = advance_trust_hash(&h1, &admit.event_hash().unwrap());
+        let bob_event = sign_event(&mut bob, h2, mutation(2, 11));
+        let state =
+            derive_trusted_state(&[genesis, admit, bob_event], &DeriveOptions::default()).unwrap();
+        assert_eq!(state.trusted_event_hashes.len(), 3);
         assert_eq!(state.membership_epoch, 2);
+        assert_eq!(state.members.len(), 2);
     }
 
     #[test]
-    fn membership_change_rotates_key_and_invalidates_invitations() {
+    fn membership_change_rotates_key() {
         let mut alice = identity(10, "Alice");
         let bob = identity(11, "Bob");
         let key1 = random_epoch_key();
-        let first_epoch = epoch(1, &[(&alice, Role::Owner), (&bob, Role::Reader)], &key1);
+        let first_epoch = epoch(1, &[(&alice, Role::Owner), (&bob, Role::Member)], &key1);
         let bob_old_wrap = first_epoch.members[1].wrapped_epoch_key.clone();
         let genesis = sign_event(&mut alice, [0; 32], EventPayload::Genesis(first_epoch));
         let h1 = trust_after(&genesis);
-        let invitation = sign_event(
-            &mut alice,
-            h1,
-            EventPayload::CreateInvitation {
-                epoch_number: 1,
-                invitation_id: [12; 16],
-                expires_at: u64::MAX,
-                pake_message: vec![1, 2, 3],
-            },
-        );
-        let h2 = advance_trust_hash(&h1, &invitation.event_hash().unwrap());
         let key2 = random_epoch_key();
         assert_ne!(&*key1, &*key2);
         let second_epoch = epoch(2, &[(&alice, Role::Owner)], &key2);
-        let remove = sign_event(&mut alice, h2, EventPayload::MembershipEpoch(second_epoch));
-        let state = derive_trusted_state(&[genesis, invitation, remove], &DeriveOptions::default())
-            .unwrap();
+        let remove = sign_event(&mut alice, h1, EventPayload::MembershipEpoch(second_epoch));
+        let state = derive_trusted_state(&[genesis, remove], &DeriveOptions::default()).unwrap();
         assert_eq!(state.membership_epoch, 2);
         assert_eq!(state.members.len(), 1);
-        assert!(state.active_invitations.is_empty());
         assert!(state
             .members
             .iter()
@@ -931,18 +621,5 @@ mod tests {
             }
         )
         .is_err());
-    }
-
-    #[test]
-    fn type_imports_remain_stable() {
-        let _ = EncryptedSnapshot {
-            nonce: [0; 12],
-            ciphertext: vec![0; 16],
-        };
-        let _ = WrappedEpochKey {
-            ephemeral_public_key: [0; 32],
-            nonce: [0; 12],
-            ciphertext: vec![0; 48],
-        };
     }
 }

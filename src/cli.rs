@@ -13,8 +13,8 @@ pub struct Cli {
     /// Vault name under refs/vaults/<name>; omit to open the repository vault manager
     pub vault: Option<String>,
 
-    /// Select an identity by backend and locator
-    #[arg(long, value_name = "BACKEND:LOCATOR")]
+    /// Select a YubiKey serial number or "touchid"
+    #[arg(long, value_name = "IDENTITY")]
     pub identity: Option<String>,
 
     #[command(subcommand)]
@@ -40,30 +40,17 @@ pub enum Command {
     Delete { key: String },
     /// List trusted members
     Members,
-    /// Create a SPAKE2 invitation challenge
-    Invite {
-        #[arg(long, default_value_t = 30)]
-        minutes: u64,
-        #[arg(long, default_value_t = 4)]
-        words: usize,
+    /// Add a physically present identity and rotate the membership epoch
+    AddMember {
+        #[arg(long)]
+        name: String,
+        /// Select the new identity; --identity continues to select the current owner
+        #[arg(long, value_name = "IDENTITY")]
+        new_identity: Option<String>,
         /// Member can read/write secrets; owner can also manage access
         #[arg(long, value_enum, default_value_t = CliRole::Member)]
         capability: CliRole,
     },
-    /// Close an active invitation
-    CloseInvitation { invitation: String },
-    /// Start a join request by proving knowledge of an invitation phrase
-    RequestAccess {
-        invitation: String,
-        #[arg(long)]
-        name: String,
-        #[arg(long)]
-        phrase_stdin: bool,
-    },
-    /// Verify an invitation phrase proof and admit the requester
-    Approve { proposal: String },
-    /// Verify admission confirmation and checkpoint the new member
-    ConfirmAccess { proposal: String },
     /// Remove a trusted member and rotate the membership epoch
     RemoveMember { member: String },
     /// Change a trusted member's capability and rotate the membership epoch
@@ -72,7 +59,7 @@ pub enum Command {
         #[arg(value_enum)]
         role: CliRole,
     },
-    /// Irreversibly replace the selected hardware identity with keys requiring no PIN or touch
+    /// Irreversibly replace the selected YubiKey identity with keys requiring no PIN or touch
     DestroyIdentity,
     /// Verify and summarize the trusted projection without unlocking values
     Verify,
@@ -98,7 +85,7 @@ pub enum CliRole {
 impl From<CliRole> for Role {
     fn from(value: CliRole) -> Self {
         match value {
-            CliRole::Member => Self::Reader,
+            CliRole::Member => Self::Member,
             CliRole::Owner => Self::Owner,
         }
     }

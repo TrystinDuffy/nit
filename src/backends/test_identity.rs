@@ -7,10 +7,7 @@ use anyhow::{ensure, Result};
 use ed25519_dalek::{Signer, SigningKey};
 use x25519_dalek::{PublicKey, StaticSecret};
 
-use crate::identity::{
-    DeviceIdentity, DiscoveredIdentity, IdentityBackend, IdentitySession, IdentityState,
-    VaultTrustRecord,
-};
+use crate::identity::{DeviceIdentity, IdentityBackend, IdentitySession, VaultTrustRecord};
 
 pub struct TestIdentityBackend {
     device: DeviceIdentity,
@@ -23,58 +20,35 @@ impl TestIdentityBackend {
     pub fn from_seed(seed: u8, locator: &str) -> Self {
         let signing = SigningKey::from_bytes(&[seed; 32]);
         let encryption = StaticSecret::from([seed.wrapping_add(64); 32]);
-        let device = DeviceIdentity {
-            backend: "test".into(),
-            locator: locator.into(),
-            display_name: format!("Test identity {locator}"),
-            encryption_public_key: PublicKey::from(&encryption).to_bytes(),
-            signing_public_key: signing.verifying_key().to_bytes(),
-        };
         Self {
-            device,
+            device: DeviceIdentity {
+                backend: IdentityBackend::TouchId,
+                locator: locator.into(),
+                display_name: format!("Test identity {locator}"),
+                encryption_public_key: PublicKey::from(&encryption).to_bytes(),
+                signing_public_key: signing.verifying_key().to_bytes(),
+            },
             signing,
             encryption,
             trust_records: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
-    pub fn discovered(&self) -> DiscoveredIdentity {
-        DiscoveredIdentity {
-            backend: "test".into(),
-            locator: self.device.locator.clone(),
-            display_name: self.device.display_name.clone(),
-            detail: "software test identity".into(),
-            state: IdentityState::Ready(self.device.clone()),
-        }
-    }
-}
-
-impl IdentityBackend for TestIdentityBackend {
-    fn id(&self) -> &'static str {
-        "test"
+    pub fn device(&self) -> DeviceIdentity {
+        self.device.clone()
     }
 
-    fn discover(&self) -> Result<Vec<DiscoveredIdentity>> {
-        Ok(vec![self.discovered()])
-    }
-
-    fn provision(&self, identity: &DiscoveredIdentity) -> Result<DeviceIdentity> {
-        ensure!(identity.backend == self.id(), "wrong test backend");
-        Ok(self.device.clone())
-    }
-
-    fn open(&self, identity: &DiscoveredIdentity) -> Result<Box<dyn IdentitySession>> {
-        ensure!(identity.backend == self.id(), "wrong test backend");
-        Ok(Box::new(TestIdentitySession {
+    pub fn open(&self) -> Box<dyn IdentitySession> {
+        Box::new(TestIdentitySession {
             device: self.device.clone(),
             signing: self.signing.clone(),
             encryption: self.encryption.clone(),
             trust_records: Arc::clone(&self.trust_records),
-        }))
+        })
     }
 }
 
-pub struct TestIdentitySession {
+struct TestIdentitySession {
     device: DeviceIdentity,
     signing: SigningKey,
     encryption: StaticSecret,

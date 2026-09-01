@@ -8,8 +8,7 @@ use ratatui::{
 
 use crate::{
     git::{validate_vault_name, GitRepository},
-    keys::InputKey,
-    terminal::{event_to_input, require_terminal, with_terminal},
+    terminal::{event_to_input, require_terminal, with_terminal, InputKey},
 };
 
 const MAX_VAULT_NAME_LEN: usize = 64;

@@ -2,49 +2,42 @@ use std::collections::BTreeSet;
 
 use anyhow::{bail, ensure, Context, Result};
 use ed25519_dalek::{Signature, VerifyingKey};
-use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 
 use crate::identity::IdentitySession;
 
 pub type Hash = [u8; 32];
 pub type VaultId = [u8; 32];
-pub type EventId = [u8; 16];
-
-pub const LOG_MAGIC: &[u8; 8] = b"GVLOG003";
-pub const EVENT_MAGIC: &[u8; 8] = b"GVEVT003";
-pub const FORMAT_VERSION: u16 = 3;
+pub const LOG_MAGIC: &[u8; 8] = b"GVLOG005";
+pub const EVENT_MAGIC: &[u8; 8] = b"GVEVT005";
+pub const FORMAT_VERSION: u16 = 5;
 pub const MAX_EVENT_SIZE: usize = 20 * 1024 * 1024;
 pub const MAX_LOG_SIZE: usize = 64 * 1024 * 1024;
 pub const MAX_MEMBERS: usize = 64;
-pub const MAX_INVITATIONS: usize = 32;
-pub const MAX_PROPOSALS: usize = 128;
 pub const MAX_KEY_LEN: usize = 1_024;
 pub const MAX_VALUE_SIZE: usize = 16 * 1024 * 1024;
 pub const MAX_NAME_LEN: usize = 128;
-pub const MAX_PAKE_MESSAGE_SIZE: usize = 64 * 1024;
 
 const SIGNATURE_DOMAIN: &[u8] = b"git-vault/event-signature/v1";
 const EVENT_HASH_DOMAIN: &[u8] = b"git-vault/event-hash/v1";
-const ADMISSION_BINDING_DOMAIN: &[u8] = b"git-vault/admission-binding/v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Role {
-    Reader,
+    Member,
     Owner,
 }
 
 impl Role {
     fn encode(self) -> u8 {
         match self {
-            Self::Reader => 1,
+            Self::Member => 1,
             Self::Owner => 2,
         }
     }
 
     fn decode(value: u8) -> Result<Self> {
         match value {
-            1 => Ok(Self::Reader),
+            1 => Ok(Self::Member),
             2 => Ok(Self::Owner),
             _ => bail!("unknown member role {value}"),
         }
@@ -93,8 +86,6 @@ pub struct MembershipEpoch {
     pub epoch_number: u64,
     pub members: Vec<EpochMember>,
     pub snapshot: EncryptedSnapshot,
-    pub accepted_proposal: Option<Hash>,
-    pub admission_confirmation: Option<Hash>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -114,24 +105,6 @@ pub enum EventPayload {
         nonce: [u8; 12],
         ciphertext: Vec<u8>,
     },
-    CreateInvitation {
-        epoch_number: u64,
-        invitation_id: [u8; 16],
-        expires_at: u64,
-        pake_message: Vec<u8>,
-    },
-    CloseInvitation {
-        invitation_id: [u8; 16],
-    },
-    JoinProposal {
-        invitation_id: [u8; 16],
-        identity: MemberIdentity,
-        pake_message: Vec<u8>,
-    },
-    Unknown {
-        type_code: u16,
-        bytes: Vec<u8>,
-    },
 }
 
 impl EventPayload {
@@ -140,22 +113,13 @@ impl EventPayload {
             Self::Genesis(_) => 1,
             Self::MembershipEpoch(_) => 2,
             Self::Mutation { .. } => 3,
-            Self::CreateInvitation { .. } => 4,
-            Self::CloseInvitation { .. } => 5,
-            Self::JoinProposal { .. } => 6,
-            Self::Unknown { type_code, .. } => *type_code,
         }
-    }
-
-    pub fn is_trust_state_changing(&self) -> bool {
-        !matches!(self, Self::JoinProposal { .. } | Self::Unknown { .. })
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Event {
     pub vault_id: VaultId,
-    pub event_id: EventId,
     pub parent_trust_hash: Hash,
     pub author_signing_key: [u8; 32],
     pub payload: EventPayload,
@@ -169,11 +133,8 @@ impl Event {
         author_signing_key: [u8; 32],
         payload: EventPayload,
     ) -> Self {
-        let mut event_id = [0u8; 16];
-        OsRng.fill_bytes(&mut event_id);
         Self {
             vault_id,
-            event_id,
             parent_trust_hash,
             author_signing_key,
             payload,
@@ -214,7 +175,6 @@ impl Event {
 
     pub fn verify_structure(&self) -> Result<()> {
         ensure!(self.vault_id != [0; 32], "vault ID cannot be zero");
-        ensure!(self.event_id != [0; 16], "event ID cannot be zero");
         validate_payload(&self.payload)?;
         let key = VerifyingKey::from_bytes(&self.author_signing_key)
             .context("invalid Ed25519 author key")?;
@@ -240,11 +200,10 @@ impl Event {
 
     fn encode_without_signature(&self) -> Result<Vec<u8>> {
         let payload = encode_payload(&self.payload)?;
-        let mut output = Vec::with_capacity(134 + payload.len());
+        let mut output = Vec::with_capacity(112 + payload.len());
         output.extend_from_slice(EVENT_MAGIC);
         put_u16(&mut output, FORMAT_VERSION);
         output.extend_from_slice(&self.vault_id);
-        output.extend_from_slice(&self.event_id);
         put_u16(&mut output, self.payload.type_code());
         output.extend_from_slice(&self.parent_trust_hash);
         output.extend_from_slice(&self.author_signing_key);
@@ -265,7 +224,6 @@ impl Event {
             "unsupported event format version"
         );
         let vault_id = decoder.array()?;
-        let event_id = decoder.array()?;
         let type_code = decoder.u16()?;
         let parent_trust_hash = decoder.array()?;
         let author_signing_key = decoder.array()?;
@@ -277,7 +235,6 @@ impl Event {
         let payload = decode_payload(type_code, payload_bytes)?;
         let event = Self {
             vault_id,
-            event_id,
             parent_trust_hash,
             author_signing_key,
             payload,
@@ -335,7 +292,6 @@ impl EventLog {
         let mut events = Vec::new();
         let mut diagnostics = Vec::new();
         let mut hashes = BTreeSet::new();
-        let mut ids = BTreeSet::new();
         let mut record = 0usize;
         while !decoder.is_empty() {
             record += 1;
@@ -360,11 +316,6 @@ impl EventLog {
                         ));
                         continue;
                     }
-                    if !ids.insert(event.event_id) {
-                        diagnostics.push(format!(
-                            "record {record}: duplicate display event ID retained as inert metadata"
-                        ));
-                    }
                     events.push(event);
                 }
                 Err(error) => diagnostics.push(format!("record {record}: {error:#}")),
@@ -385,14 +336,6 @@ impl EventLog {
             .any(|item| item.verified_event_hash().ok() == Some(hash))
         {
             return Ok(());
-        }
-        if self
-            .events
-            .iter()
-            .any(|item| item.event_id == event.event_id)
-        {
-            self.diagnostics
-                .push("duplicate display event ID retained; event hashes remain unique".into());
         }
         self.events.push(event);
         ensure!(
@@ -457,27 +400,6 @@ fn put_event_record(output: &mut Vec<u8>, event: &Event) -> Result<()> {
     Ok(())
 }
 
-pub fn admission_binding_digest(
-    vault_id: &VaultId,
-    parent_trust_hash: &Hash,
-    epoch: &MembershipEpoch,
-) -> Result<Hash> {
-    let proposal = epoch
-        .accepted_proposal
-        .context("admission epoch has no accepted proposal")?;
-    let mut unconfirmed = epoch.clone();
-    unconfirmed.admission_confirmation = None;
-    let mut encoded = Vec::new();
-    encode_epoch(&mut encoded, &unconfirmed)?;
-    let mut hasher = Sha256::new();
-    hasher.update(ADMISSION_BINDING_DOMAIN);
-    hasher.update(vault_id);
-    hasher.update(parent_trust_hash);
-    hasher.update(proposal);
-    hasher.update(encoded);
-    Ok(hasher.finalize().into())
-}
-
 fn validate_payload(payload: &EventPayload) -> Result<()> {
     match payload {
         EventPayload::Genesis(epoch) | EventPayload::MembershipEpoch(epoch) => {
@@ -489,41 +411,11 @@ fn validate_payload(payload: &EventPayload) -> Result<()> {
                 "invalid encrypted mutation size"
             );
         }
-        EventPayload::CreateInvitation {
-            invitation_id,
-            pake_message,
-            ..
-        }
-        | EventPayload::JoinProposal {
-            invitation_id,
-            pake_message,
-            ..
-        } => {
-            ensure!(*invitation_id != [0; 16], "invitation ID cannot be zero");
-            ensure!(
-                pake_message.len() <= MAX_PAKE_MESSAGE_SIZE,
-                "PAKE message is too large"
-            );
-        }
-        EventPayload::CloseInvitation { invitation_id } => {
-            ensure!(*invitation_id != [0; 16], "invitation ID cannot be zero");
-        }
-        EventPayload::Unknown { type_code, .. } => ensure!(
-            !(1..=6).contains(type_code),
-            "unknown event payload uses a reserved type code"
-        ),
-    }
-    if let EventPayload::JoinProposal { identity, .. } = payload {
-        validate_member_identity(identity)?;
     }
     Ok(())
 }
 
 fn validate_epoch(epoch: &MembershipEpoch) -> Result<()> {
-    ensure!(
-        epoch.accepted_proposal.is_some() == epoch.admission_confirmation.is_some(),
-        "accepted proposal and admission confirmation must appear together"
-    );
     ensure!(epoch.epoch_number > 0, "membership epoch must be positive");
     ensure!(!epoch.members.is_empty(), "membership epoch has no members");
     ensure!(epoch.members.len() <= MAX_MEMBERS, "too many members");
@@ -588,30 +480,6 @@ fn encode_payload(payload: &EventPayload) -> Result<Vec<u8>> {
             output.extend_from_slice(nonce);
             put_bytes(&mut output, ciphertext)?;
         }
-        EventPayload::CreateInvitation {
-            epoch_number,
-            invitation_id,
-            expires_at,
-            pake_message,
-        } => {
-            put_u64(&mut output, *epoch_number);
-            output.extend_from_slice(invitation_id);
-            put_u64(&mut output, *expires_at);
-            put_bytes(&mut output, pake_message)?;
-        }
-        EventPayload::CloseInvitation { invitation_id } => {
-            output.extend_from_slice(invitation_id);
-        }
-        EventPayload::JoinProposal {
-            invitation_id,
-            identity,
-            pake_message,
-        } => {
-            output.extend_from_slice(invitation_id);
-            encode_member_identity(&mut output, identity)?;
-            put_bytes(&mut output, pake_message)?;
-        }
-        EventPayload::Unknown { bytes, .. } => output.extend_from_slice(bytes),
     }
     Ok(output)
 }
@@ -626,26 +494,7 @@ fn decode_payload(type_code: u16, bytes: &[u8]) -> Result<EventPayload> {
             nonce: decoder.array()?,
             ciphertext: decoder.bytes(MAX_VALUE_SIZE + MAX_KEY_LEN + 64, "encrypted mutation")?,
         },
-        4 => EventPayload::CreateInvitation {
-            epoch_number: decoder.u64()?,
-            invitation_id: decoder.array()?,
-            expires_at: decoder.u64()?,
-            pake_message: decoder.bytes(MAX_PAKE_MESSAGE_SIZE, "PAKE message")?,
-        },
-        5 => EventPayload::CloseInvitation {
-            invitation_id: decoder.array()?,
-        },
-        6 => EventPayload::JoinProposal {
-            invitation_id: decoder.array()?,
-            identity: decode_member_identity(&mut decoder)?,
-            pake_message: decoder.bytes(MAX_PAKE_MESSAGE_SIZE, "PAKE message")?,
-        },
-        _ => {
-            return Ok(EventPayload::Unknown {
-                type_code,
-                bytes: bytes.to_vec(),
-            });
-        }
+        _ => bail!("unknown event type {type_code}"),
     };
     decoder.finish()?;
     validate_payload(&payload)?;
@@ -664,8 +513,6 @@ fn encode_epoch(output: &mut Vec<u8>, epoch: &MembershipEpoch) -> Result<()> {
     }
     output.extend_from_slice(&epoch.snapshot.nonce);
     put_bytes(output, &epoch.snapshot.ciphertext)?;
-    put_optional_hash(output, &epoch.accepted_proposal);
-    put_optional_hash(output, &epoch.admission_confirmation);
     Ok(())
 }
 
@@ -689,14 +536,10 @@ fn decode_epoch(decoder: &mut Decoder<'_>) -> Result<MembershipEpoch> {
         nonce: decoder.array()?,
         ciphertext: decoder.bytes(MAX_VALUE_SIZE + 16, "encrypted snapshot")?,
     };
-    let accepted_proposal = decoder.optional_hash("accepted proposal")?;
-    let admission_confirmation = decoder.optional_hash("admission confirmation")?;
     Ok(MembershipEpoch {
         epoch_number,
         members,
         snapshot,
-        accepted_proposal,
-        admission_confirmation,
     })
 }
 
@@ -713,16 +556,6 @@ fn decode_member_identity(decoder: &mut Decoder<'_>) -> Result<MemberIdentity> {
         signing_public_key: decoder.array()?,
         encryption_public_key: decoder.array()?,
     })
-}
-
-fn put_optional_hash(output: &mut Vec<u8>, value: &Option<Hash>) {
-    match value {
-        Some(hash) => {
-            output.push(1);
-            output.extend_from_slice(hash);
-        }
-        None => output.push(0),
-    }
 }
 
 fn put_u16(output: &mut Vec<u8>, value: u16) {
@@ -800,14 +633,6 @@ impl<'a> Decoder<'a> {
         Ok(self.take(length)?.to_vec())
     }
 
-    fn optional_hash(&mut self, field: &str) -> Result<Option<Hash>> {
-        match self.u8()? {
-            0 => Ok(None),
-            1 => Ok(Some(self.array()?)),
-            value => bail!("invalid {field} marker {value}"),
-        }
-    }
-
     fn string(&mut self, limit: usize, field: &str) -> Result<String> {
         let bytes = self.bytes(limit, field)?;
         String::from_utf8(bytes).with_context(|| format!("{field} is not UTF-8"))
@@ -828,7 +653,7 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
 
     use super::*;
-    use crate::identity::{DeviceIdentity, IdentitySession};
+    use crate::identity::{DeviceIdentity, IdentityBackend, IdentitySession};
 
     struct TestSession {
         identity: DeviceIdentity,
@@ -850,9 +675,13 @@ mod tests {
     }
 
     fn signed_event() -> Event {
+        signed_event_with_marker(4)
+    }
+
+    fn signed_event_with_marker(marker: u8) -> Event {
         let signing = SigningKey::from_bytes(&[7; 32]);
         let identity = DeviceIdentity {
-            backend: "test".into(),
+            backend: IdentityBackend::TouchId,
             locator: "1".into(),
             display_name: "Test".into(),
             encryption_public_key: [8; 32],
@@ -866,7 +695,7 @@ mod tests {
             EventPayload::Mutation {
                 epoch_number: 1,
                 nonce: [3; 12],
-                ciphertext: vec![4; 16],
+                ciphertext: vec![marker; 16],
             },
         )
         .sign(&mut session)
@@ -914,7 +743,7 @@ mod tests {
         assert_eq!(log.events.len(), 1);
         assert_eq!(log.diagnostics.len(), 1);
 
-        log.append(signed_event()).unwrap();
+        log.append(signed_event_with_marker(5)).unwrap();
         let appended = log.encode().unwrap();
         let decoded = EventLog::decode(&appended).unwrap();
         assert_eq!(decoded.events.len(), 2);
@@ -940,41 +769,9 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_display_ids_do_not_invalidate_unique_event_hashes() {
-        let first = signed_event();
-        let signing = SigningKey::from_bytes(&[7; 32]);
-        let identity = DeviceIdentity {
-            backend: "test".into(),
-            locator: "1".into(),
-            display_name: "Test".into(),
-            encryption_public_key: [8; 32],
-            signing_public_key: signing.verifying_key().to_bytes(),
-        };
-        let mut session = TestSession { identity, signing };
-        let mut second = Event::unsigned(
-            [1; 32],
-            [2; 32],
-            session.identity.signing_public_key,
-            EventPayload::Mutation {
-                epoch_number: 1,
-                nonce: [9; 12],
-                ciphertext: vec![10; 16],
-            },
-        );
-        second.event_id = first.event_id;
-        let second = second.sign(&mut session).unwrap();
-        let mut encoded = LOG_MAGIC.to_vec();
-        put_event_record(&mut encoded, &first).unwrap();
-        put_event_record(&mut encoded, &second).unwrap();
-        let decoded = EventLog::decode(&encoded).unwrap();
-        assert_eq!(decoded.events.len(), 2);
-        assert_eq!(decoded.diagnostics.len(), 1);
-    }
-
-    #[test]
     fn event_collection_union_is_commutative_and_preserves_candidates() {
         let first = signed_event();
-        let second = signed_event();
+        let second = signed_event_with_marker(5);
         let left = EventLog {
             events: vec![first.clone()],
             diagnostics: Vec::new(),
@@ -992,32 +789,5 @@ mod tests {
         );
         assert!(merged_left.events.contains(&first));
         assert!(merged_left.events.contains(&second));
-    }
-
-    #[test]
-    fn unknown_signed_event_is_structurally_valid_but_inert() {
-        let signing = SigningKey::from_bytes(&[11; 32]);
-        let identity = DeviceIdentity {
-            backend: "test".into(),
-            locator: "unknown".into(),
-            display_name: "Unknown".into(),
-            encryption_public_key: [12; 32],
-            signing_public_key: signing.verifying_key().to_bytes(),
-        };
-        let mut session = TestSession { identity, signing };
-        let event = Event::unsigned(
-            [1; 32],
-            [2; 32],
-            session.identity.signing_public_key,
-            EventPayload::Unknown {
-                type_code: 65_000,
-                bytes: vec![1, 2, 3],
-            },
-        )
-        .sign(&mut session)
-        .unwrap();
-        let decoded = Event::decode(&event.encode().unwrap()).unwrap();
-        assert_eq!(decoded, event);
-        assert!(!decoded.payload.is_trust_state_changing());
     }
 }
