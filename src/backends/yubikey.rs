@@ -659,162 +659,148 @@ impl YubiKey {
     }
 }
 
-pub struct YubiKeyBackend;
-
-impl IdentityBackend for YubiKeyBackend {
-    fn id(&self) -> &'static str {
-        "yubikey"
-    }
-
-    fn discover(&self) -> Result<Vec<DiscoveredIdentity>> {
-        Ok(YubiKey::list_devices()?
-            .into_iter()
-            .map(|device| {
-                let encryption_public_key = device.encryption_slot.public_key_for(ALG_X25519);
-                let signing_public_key = device.signing_slot.public_key_for(ALG_ED25519);
-                let policy_error = device_policy_error(&device);
-                let state = match (encryption_public_key, signing_public_key, policy_error) {
-                    (Some(encryption_public_key), Some(signing_public_key), None) => {
-                        IdentityState::Ready(DeviceIdentity {
-                            backend: self.id().into(),
-                            locator: device.serial.to_string(),
-                            display_name: format!("YubiKey {}", device.serial),
-                            encryption_public_key,
-                            signing_public_key,
-                        })
-                    }
-                    (_, _, Some(error)) => IdentityState::Unavailable(error),
-                    _ if matches!(
-                        device.encryption_slot,
-                        SlotInfo::Empty | SlotInfo::X25519(_)
-                    ) && matches!(
-                        device.signing_slot,
-                        SlotInfo::Empty | SlotInfo::Ed25519(_)
-                    ) =>
-                    {
-                        IdentityState::Provisionable
-                    }
-                    _ => IdentityState::Unavailable(format!(
-                        "{}; {}",
-                        device.encryption_slot.description(ENCRYPTION_SLOT),
-                        device.signing_slot.description(SIGNING_SLOT)
-                    )),
-                };
-                DiscoveredIdentity {
-                    backend: self.id().into(),
-                    locator: device.serial.to_string(),
-                    display_name: format!("YubiKey {}", device.serial),
-                    detail: format!(
-                        "firmware {}.{}.{}; {}; PIN {}; touch {}; {}; PIN {}; touch {}",
-                        device.version[0],
-                        device.version[1],
-                        device.version[2],
-                        device.encryption_slot.description(ENCRYPTION_SLOT),
-                        pin_policy_description(device.encryption_pin_policy),
-                        touch_policy_description(device.encryption_touch_policy),
-                        device.signing_slot.description(SIGNING_SLOT),
-                        pin_policy_description(device.signing_pin_policy),
-                        touch_policy_description(device.signing_touch_policy)
-                    ),
-                    state,
+pub fn discover() -> Result<Vec<DiscoveredIdentity>> {
+    Ok(YubiKey::list_devices()?
+        .into_iter()
+        .map(|device| {
+            let encryption_public_key = device.encryption_slot.public_key_for(ALG_X25519);
+            let signing_public_key = device.signing_slot.public_key_for(ALG_ED25519);
+            let policy_error = device_policy_error(&device);
+            let state = match (encryption_public_key, signing_public_key, policy_error) {
+                (Some(encryption_public_key), Some(signing_public_key), None) => {
+                    IdentityState::Ready(DeviceIdentity {
+                        backend: IdentityBackend::YubiKey,
+                        locator: device.serial.to_string(),
+                        display_name: format!("YubiKey {}", device.serial),
+                        encryption_public_key,
+                        signing_public_key,
+                    })
                 }
-            })
-            .collect())
-    }
-
-    fn provision(&self, identity: &DiscoveredIdentity) -> Result<DeviceIdentity> {
-        ensure!(identity.backend == self.id(), "wrong identity backend");
-        ensure!(
-            identity.state.is_usable(),
-            "{} cannot be provisioned: {}",
-            identity.display_name,
-            identity.state.description()
-        );
-        if let IdentityState::Ready(device) = &identity.state {
-            return Ok(device.clone());
-        }
-        let serial = parse_locator(&identity.locator)?;
-        let mut key = YubiKey::open(Some(serial))?;
-        let encryption_public_key = key.ensure_x25519_key(ENCRYPTION_SLOT)?;
-        let signing_public_key = key.ensure_ed25519_key(SIGNING_SLOT)?;
-        Ok(DeviceIdentity {
-            backend: self.id().into(),
-            locator: identity.locator.clone(),
-            display_name: identity.display_name.clone(),
-            encryption_public_key,
-            signing_public_key,
+                (_, _, Some(error)) => IdentityState::Unavailable(error),
+                _ if matches!(
+                    device.encryption_slot,
+                    SlotInfo::Empty | SlotInfo::X25519(_)
+                ) && matches!(device.signing_slot, SlotInfo::Empty | SlotInfo::Ed25519(_)) =>
+                {
+                    IdentityState::Provisionable
+                }
+                _ => IdentityState::Unavailable(format!(
+                    "{}; {}",
+                    device.encryption_slot.description(ENCRYPTION_SLOT),
+                    device.signing_slot.description(SIGNING_SLOT)
+                )),
+            };
+            DiscoveredIdentity {
+                backend: IdentityBackend::YubiKey,
+                locator: device.serial.to_string(),
+                display_name: format!("YubiKey {}", device.serial),
+                detail: format!(
+                    "firmware {}.{}.{}; {}; PIN {}; touch {}; {}; PIN {}; touch {}",
+                    device.version[0],
+                    device.version[1],
+                    device.version[2],
+                    device.encryption_slot.description(ENCRYPTION_SLOT),
+                    pin_policy_description(device.encryption_pin_policy),
+                    touch_policy_description(device.encryption_touch_policy),
+                    device.signing_slot.description(SIGNING_SLOT),
+                    pin_policy_description(device.signing_pin_policy),
+                    touch_policy_description(device.signing_touch_policy)
+                ),
+                state,
+            }
         })
-    }
+        .collect())
+}
 
-    fn destroy_and_reprovision_without_user_auth(
-        &self,
-        identity: &DiscoveredIdentity,
-    ) -> Result<DeviceIdentity> {
-        ensure!(identity.backend == self.id(), "wrong identity backend");
-        let serial = parse_locator(&identity.locator)?;
-        let mut key = YubiKey::open(Some(serial))?;
-        let (encryption_public_key, signing_public_key) =
-            key.destroy_and_generate_unprotected_identity()?;
-        Ok(DeviceIdentity {
-            backend: self.id().into(),
-            locator: identity.locator.clone(),
-            display_name: identity.display_name.clone(),
-            encryption_public_key,
-            signing_public_key,
-        })
+pub fn provision(identity: &DiscoveredIdentity) -> Result<DeviceIdentity> {
+    ensure!(
+        identity.state.is_usable(),
+        "{} cannot be provisioned: {}",
+        identity.display_name,
+        identity.state.description()
+    );
+    if let IdentityState::Ready(device) = &identity.state {
+        return Ok(device.clone());
     }
+    let serial = parse_locator(&identity.locator)?;
+    let mut key = YubiKey::open(Some(serial))?;
+    let encryption_public_key = key.ensure_x25519_key(ENCRYPTION_SLOT)?;
+    let signing_public_key = key.ensure_ed25519_key(SIGNING_SLOT)?;
+    Ok(DeviceIdentity {
+        backend: IdentityBackend::YubiKey,
+        locator: identity.locator.clone(),
+        display_name: identity.display_name.clone(),
+        encryption_public_key,
+        signing_public_key,
+    })
+}
 
-    fn open(&self, identity: &DiscoveredIdentity) -> Result<Box<dyn IdentitySession>> {
-        let IdentityState::Ready(device) = &identity.state else {
-            bail!("{} is not provisioned", identity.display_name);
-        };
-        let serial = parse_locator(&identity.locator)?;
-        let mut key = YubiKey::open(Some(serial))?;
-        ensure!(
-            key.version >= [5, 7, 4],
-            "YubiKey firmware must be 5.7.4 or newer"
+pub fn destroy_and_reprovision_without_user_auth(
+    identity: &DiscoveredIdentity,
+) -> Result<DeviceIdentity> {
+    let serial = parse_locator(&identity.locator)?;
+    let mut key = YubiKey::open(Some(serial))?;
+    let (encryption_public_key, signing_public_key) =
+        key.destroy_and_generate_unprotected_identity()?;
+    Ok(DeviceIdentity {
+        backend: IdentityBackend::YubiKey,
+        locator: identity.locator.clone(),
+        display_name: identity.display_name.clone(),
+        encryption_public_key,
+        signing_public_key,
+    })
+}
+
+pub fn open(identity: &DiscoveredIdentity) -> Result<Box<dyn IdentitySession>> {
+    let IdentityState::Ready(device) = &identity.state else {
+        bail!("{} is not provisioned", identity.display_name);
+    };
+    let serial = parse_locator(&identity.locator)?;
+    let mut key = YubiKey::open(Some(serial))?;
+    ensure!(
+        key.version >= [5, 7, 4],
+        "YubiKey firmware must be 5.7.4 or newer"
+    );
+    let encryption_metadata = key
+        .slot_metadata(ENCRYPTION_SLOT)?
+        .context("slot 82 X25519 key is absent")?;
+    ensure!(
+        encryption_metadata.algorithm == ALG_X25519
+            && pin_policy_is_supported(encryption_metadata.pin_policy)
+            && touch_policy_is_supported(encryption_metadata.touch_policy),
+        "slot 82 must be X25519 with reported PIN and touch policies"
+    );
+    let signing_metadata = key
+        .slot_metadata(SIGNING_SLOT)?
+        .context("slot 83 Ed25519 key is absent")?;
+    ensure!(
+        signing_metadata.algorithm == ALG_ED25519
+            && pin_policy_is_supported(signing_metadata.pin_policy)
+            && touch_policy_is_supported(signing_metadata.touch_policy),
+        "slot 83 must be Ed25519 with reported PIN and touch policies"
+    );
+    let encryption_touch_policy = encryption_metadata.touch_policy;
+    let signing_touch_policy = signing_metadata.touch_policy;
+    if encryption_metadata.pin_policy != Some(PIN_POLICY_NEVER)
+        || signing_metadata.pin_policy != Some(PIN_POLICY_NEVER)
+    {
+        let pin = Zeroizing::new(
+            rpassword::prompt_password("PIV PIN: ").context("failed to read PIV PIN")?,
         );
-        let encryption_metadata = key
-            .slot_metadata(ENCRYPTION_SLOT)?
-            .context("slot 82 X25519 key is absent")?;
         ensure!(
-            encryption_metadata.algorithm == ALG_X25519
-                && pin_policy_is_supported(encryption_metadata.pin_policy)
-                && touch_policy_is_supported(encryption_metadata.touch_policy),
-            "slot 82 must be X25519 with reported PIN and touch policies"
+            !pin.is_empty(),
+            "an empty PIV PIN was not sent to the YubiKey"
         );
-        let signing_metadata = key
-            .slot_metadata(SIGNING_SLOT)?
-            .context("slot 83 Ed25519 key is absent")?;
-        ensure!(
-            signing_metadata.algorithm == ALG_ED25519
-                && pin_policy_is_supported(signing_metadata.pin_policy)
-                && touch_policy_is_supported(signing_metadata.touch_policy),
-            "slot 83 must be Ed25519 with reported PIN and touch policies"
-        );
-        let encryption_touch_policy = encryption_metadata.touch_policy;
-        let signing_touch_policy = signing_metadata.touch_policy;
-        if encryption_metadata.pin_policy != Some(PIN_POLICY_NEVER)
-            || signing_metadata.pin_policy != Some(PIN_POLICY_NEVER)
-        {
-            let pin = Zeroizing::new(
-                rpassword::prompt_password("PIV PIN: ").context("failed to read PIV PIN")?,
-            );
-            ensure!(
-                !pin.is_empty(),
-                "an empty PIV PIN was not sent to the YubiKey"
-            );
-            key.verify_pin(&pin)?;
-        }
-        Ok(Box::new(YubiKeySession {
-            key,
-            identity: device.clone(),
-            encryption_touch_policy,
-            signing_touch_policy,
-            last_agree: None,
-            last_sign: None,
-        }))
+        key.verify_pin(&pin)?;
     }
+    Ok(Box::new(YubiKeySession {
+        key,
+        identity: device.clone(),
+        encryption_touch_policy,
+        signing_touch_policy,
+        last_agree: None,
+        last_sign: None,
+    }))
 }
 
 struct YubiKeySession {
@@ -1212,7 +1198,7 @@ mod tests {
     #[test]
     fn trust_record_object_round_trip_is_identity_bound() {
         let identity = DeviceIdentity {
-            backend: "test".into(),
+            backend: IdentityBackend::YubiKey,
             locator: "1".into(),
             display_name: "test".into(),
             encryption_public_key: [2; 32],

@@ -1,0 +1,3 @@
+#!/bin/sh
+cd "$(dirname "$0")" || exit
+exec cargo install --locked --path . --root "$HOME/.local" --force

@@ -4,8 +4,6 @@ pub mod crypto;
 pub mod event;
 pub mod git;
 pub mod identity;
-pub mod invitation;
-pub mod keys;
 pub mod manager;
 pub mod runtime;
 pub mod state;

@@ -64,7 +64,6 @@ impl GitRepository {
         validate_vault_name(vault)?;
         let primary = vault_ref(vault);
         let local = local_ref(vault);
-        let onboarding_prefix = format!("refs/vault-onboarding/{vault}/");
         let mut references = self
             .list_refs("refs/vaults/")?
             .into_iter()
@@ -74,7 +73,6 @@ impl GitRepository {
                     .into_iter()
                     .filter(|reference| reference == &local),
             )
-            .chain(self.list_refs(&onboarding_prefix)?)
             .collect::<Vec<_>>();
         references.extend(
             self.list_refs("refs/vault-remotes/")?
@@ -220,72 +218,6 @@ impl GitRepository {
         ensure!(
             output.status.success(),
             "local freshness checkpoint changed concurrently"
-        );
-        Ok(())
-    }
-
-    pub fn read_onboarding_state(&self, vault: &str, event_hash: &Hash) -> Result<Vec<u8>> {
-        validate_vault_name(vault)?;
-        let reference = onboarding_ref(vault, event_hash);
-        let oid = self
-            .resolve_ref(&reference, "blob")?
-            .context("local onboarding state is absent on this machine")?;
-        self.git_bytes(["cat-file", "blob", &oid])
-    }
-
-    pub fn write_onboarding_state(
-        &self,
-        vault: &str,
-        event_hash: &Hash,
-        bytes: &[u8],
-    ) -> Result<()> {
-        validate_vault_name(vault)?;
-        ensure!(
-            bytes.len() <= 256 * 1024,
-            "local onboarding state is too large"
-        );
-        let reference = onboarding_ref(vault, event_hash);
-        let old = self.resolve_ref(&reference, "blob")?;
-        let blob = self.hash_object(bytes)?;
-        let old = old.unwrap_or_else(|| "0".repeat(blob.len()));
-        let output = self.git_output(["update-ref", &reference, &blob, &old], None)?;
-        ensure!(
-            output.status.success(),
-            "local onboarding state changed concurrently"
-        );
-        Ok(())
-    }
-
-    pub fn delete_onboarding_state(&self, vault: &str, event_hash: &Hash) -> Result<()> {
-        validate_vault_name(vault)?;
-        let reference = onboarding_ref(vault, event_hash);
-        let Some(old) = self.resolve_ref(&reference, "blob")? else {
-            return Ok(());
-        };
-        let output = self.git_output(["update-ref", "-d", &reference, &old], None)?;
-        ensure!(
-            output.status.success(),
-            "local onboarding state changed concurrently"
-        );
-        Ok(())
-    }
-
-    pub fn advance_vault_ref(
-        &self,
-        vault: &str,
-        expected_commit: Option<&str>,
-        new_commit: &str,
-    ) -> Result<()> {
-        validate_vault_name(vault)?;
-        validate_oid(new_commit)?;
-        let old = expected_commit
-            .map(str::to_owned)
-            .unwrap_or_else(|| "0".repeat(new_commit.len()));
-        let reference = vault_ref(vault);
-        let output = self.git_output(["update-ref", &reference, new_commit, &old], None)?;
-        ensure!(
-            output.status.success(),
-            "vault ref changed concurrently; fetch and verify again"
         );
         Ok(())
     }
@@ -480,10 +412,6 @@ fn local_ref(vault: &str) -> String {
     format!("refs/vault-local/{vault}")
 }
 
-fn onboarding_ref(vault: &str, event_hash: &Hash) -> String {
-    format!("refs/vault-onboarding/{vault}/{}", hex::encode(event_hash))
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -519,18 +447,6 @@ mod tests {
             Some([7; 32])
         );
 
-        repository
-            .write_onboarding_state("prod", &[8; 32], b"pake-state")
-            .unwrap();
-        assert_eq!(
-            repository.read_onboarding_state("prod", &[8; 32]).unwrap(),
-            b"pake-state"
-        );
-        repository
-            .delete_onboarding_state("prod", &[8; 32])
-            .unwrap();
-        assert!(repository.read_onboarding_state("prod", &[8; 32]).is_err());
-
         let archive = repository
             .append_vault_log("archive", None, &log, "create another vault")
             .unwrap();
@@ -550,9 +466,6 @@ mod tests {
             assert!(output.status.success());
         }
         repository
-            .write_onboarding_state("prod", &[9; 32], b"pending")
-            .unwrap();
-        repository
             .git_output(
                 [
                     "update-ref",
@@ -566,7 +479,7 @@ mod tests {
             repository.list_vaults().unwrap(),
             vec!["archive".to_owned(), "prod".to_owned()]
         );
-        assert_eq!(repository.delete_vault("prod").unwrap(), 4);
+        assert_eq!(repository.delete_vault("prod").unwrap(), 3);
         assert!(repository.read_vault("prod").unwrap().is_none());
         assert!(repository.read_local_checkpoint("prod").unwrap().is_none());
         assert_eq!(repository.list_vaults().unwrap(), vec!["archive"]);

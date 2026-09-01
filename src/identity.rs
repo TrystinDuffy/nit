@@ -4,9 +4,15 @@ use sha2::{Digest, Sha256};
 pub const PUBLIC_KEY_SIZE: usize = 32;
 pub const SIGNATURE_SIZE: usize = 64;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IdentityBackend {
+    YubiKey,
+    TouchId,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeviceIdentity {
-    pub backend: String,
+    pub backend: IdentityBackend,
     pub locator: String,
     pub display_name: String,
     pub encryption_public_key: [u8; PUBLIC_KEY_SIZE],
@@ -46,17 +52,11 @@ impl IdentityState {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiscoveredIdentity {
-    pub backend: String,
+    pub backend: IdentityBackend,
     pub locator: String,
     pub display_name: String,
     pub detail: String,
     pub state: IdentityState,
-}
-
-impl DiscoveredIdentity {
-    pub fn selector(&self) -> String {
-        format!("{}:{}", self.backend, self.locator)
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -89,19 +89,5 @@ pub trait IdentitySession {
 
     fn write_trust_record(&mut self, _record: &VaultTrustRecord) -> Result<()> {
         bail!("this identity backend does not yet support hardware trust checkpoints")
-    }
-}
-
-pub trait IdentityBackend {
-    fn id(&self) -> &'static str;
-    fn discover(&self) -> Result<Vec<DiscoveredIdentity>>;
-    fn provision(&self, identity: &DiscoveredIdentity) -> Result<DeviceIdentity>;
-    fn open(&self, identity: &DiscoveredIdentity) -> Result<Box<dyn IdentitySession>>;
-
-    fn destroy_and_reprovision_without_user_auth(
-        &self,
-        _identity: &DiscoveredIdentity,
-    ) -> Result<DeviceIdentity> {
-        bail!("this identity backend cannot destructively replace an identity")
     }
 }

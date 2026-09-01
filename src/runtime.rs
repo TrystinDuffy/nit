@@ -1,31 +1,31 @@
 use std::{
     collections::BTreeMap,
     io::{self, IsTerminal, Read},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use crate::{
+    backends::{self, yubikey},
     cli::{Cli, Command},
     crypto::{self, random_epoch_key, unwrap_epoch_key, DecryptedMutation, VaultValue},
     event::{
-        EpochMember, Event, EventLog, EventPayload, Hash, MemberIdentity, MembershipEpoch, Role,
+        EpochMember, Event, EventLog, EventPayload, MemberIdentity, MembershipEpoch, Role,
+        MAX_NAME_LEN,
     },
     git::{self, GitRepository, StoredLog},
     identity::{
         self, DeviceIdentity, DiscoveredIdentity, IdentityOperation, IdentitySession, IdentityState,
     },
-    invitation::{self, ClientSessionState},
     manager::{self, ManagerAction},
     state::{derive_trusted_state, DeriveOptions, TrustedState},
     terminal::{
-        choose_identity, choose_option, discard_pending_input, discover_identities, event_to_input,
-        identity_backend, prompt_line, require_terminal, suspend_terminal, with_terminal,
+        choose_identity, discard_pending_input, discover_identities, event_to_input, prompt_line,
+        require_terminal, suspend_terminal, with_terminal,
     },
     tui::{Effect, VaultUi},
 };
 use anyhow::{bail, ensure, Context, Result};
 use rand_core::{OsRng, RngCore};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 pub fn run(cli: Cli) -> Result<()> {
     let repository = GitRepository::discover(".")?;
@@ -72,32 +72,6 @@ pub fn run(cli: Cli) -> Result<()> {
         let state = derive_with_checkpoints(&repository, &vault, &stored.log, None)?;
         print_verification(&stored, &state);
         return Ok(());
-    }
-    if let Some(Command::RequestAccess {
-        invitation,
-        name,
-        phrase_stdin,
-    }) = &cli.command
-    {
-        return request_access(
-            &repository,
-            &vault,
-            stored.context("vault does not exist")?,
-            cli.identity.as_deref(),
-            invitation,
-            name,
-            *phrase_stdin,
-        );
-    }
-    if let Some(Command::ConfirmAccess { proposal }) = &cli.command {
-        return confirm_access(
-            &repository,
-            &vault,
-            stored.context("vault does not exist")?,
-            cli.identity.as_deref(),
-            proposal,
-        )
-        .map(|_| ());
     }
     if cli.command.is_none() {
         if let Some(stored) = stored.clone() {
@@ -160,30 +134,14 @@ pub fn run(cli: Cli) -> Result<()> {
             print_members(&session.state);
             Ok(())
         }
-        Some(Command::Invite {
-            minutes,
-            words,
+        Some(Command::AddMember {
+            name,
+            new_identity,
             capability,
         }) => {
-            print_identity_hint(session.identity.as_ref(), IdentityOperation::Sign);
-            let (invitation_id, mut phrase) =
-                session.create_invitation(minutes, words, capability.into())?;
-            println!("{}", phrase.as_str());
-            eprintln!(
-                "Invitation ID: {} ({})",
-                hex::encode_upper(invitation_id),
-                capability_name(capability.into())
-            );
-            phrase.zeroize();
+            session.add_connected_member(new_identity.as_deref(), name, capability.into())?;
+            println!("Member added and checkpointed");
             Ok(())
-        }
-        Some(Command::CloseInvitation { invitation }) => {
-            print_identity_hint(session.identity.as_ref(), IdentityOperation::Sign);
-            session.close_invitation(&invitation)
-        }
-        Some(Command::Approve { proposal }) => {
-            print_identity_hint(session.identity.as_ref(), IdentityOperation::Sign);
-            session.approve_proposal(&proposal)
         }
         Some(Command::RemoveMember { member }) => {
             print_identity_hint(session.identity.as_ref(), IdentityOperation::Sign);
@@ -197,9 +155,7 @@ pub fn run(cli: Cli) -> Result<()> {
             Command::DestroyIdentity
             | Command::Verify
             | Command::Fetch { .. }
-            | Command::Push { .. }
-            | Command::RequestAccess { .. }
-            | Command::ConfirmAccess { .. },
+            | Command::Push { .. },
         ) => unreachable!(),
         None => session.run_tui(),
     }
@@ -218,6 +174,7 @@ struct OpenVault {
 
 impl OpenVault {
     fn append_put(&mut self, key: String, value: VaultValue) -> Result<()> {
+        let previous_hash = self.state.current_trust_hash;
         let (nonce, ciphertext) = crypto::encrypt_mutation(
             &self.state.vault_id,
             self.state.membership_epoch,
@@ -227,156 +184,147 @@ impl OpenVault {
             },
             &self.epoch_key,
         )?;
-        self.append_payload(
+        let result = self.append_payload(
             EventPayload::Mutation {
                 epoch_number: self.state.membership_epoch,
                 nonce,
                 ciphertext,
             },
             "append encrypted Put mutation",
-        )?;
-        self.values.insert(key, value);
-        Ok(())
+        );
+        if self.state.current_trust_hash != previous_hash {
+            self.values.insert(key, value);
+        }
+        result
     }
 
     fn append_delete(&mut self, key: String) -> Result<()> {
+        let previous_hash = self.state.current_trust_hash;
         let (nonce, ciphertext) = crypto::encrypt_mutation(
             &self.state.vault_id,
             self.state.membership_epoch,
             &DecryptedMutation::Delete { key: key.clone() },
             &self.epoch_key,
         )?;
-        self.append_payload(
+        let result = self.append_payload(
             EventPayload::Mutation {
                 epoch_number: self.state.membership_epoch,
                 nonce,
                 ciphertext,
             },
             "append encrypted Delete mutation",
-        )?;
-        self.values.remove(&key);
-        Ok(())
-    }
-
-    fn create_invitation(
-        &mut self,
-        minutes: u64,
-        words: usize,
-        invited_role: Role,
-    ) -> Result<([u8; 16], Zeroizing<String>)> {
-        ensure!(
-            (1..=10_080).contains(&minutes),
-            "invitation duration must be 1–10080 minutes"
         );
-        let phrase = invitation::generate_phrase(words)?;
-        let mut invitation_id = [0u8; 16];
-        OsRng.fill_bytes(&mut invitation_id);
-        let expires_at = now_unix()
-            .checked_add(minutes.saturating_mul(60))
-            .context("invitation expiration overflow")?;
-        let creator = self
-            .state
-            .member_for_signing_key(&self.identity.identity().signing_public_key)
-            .context("invitation creator is not a current member")?
-            .identity
-            .clone();
-        let pake_message = invitation::create_registration(
-            &self.state.vault_id,
-            self.state.membership_epoch,
-            &self.state.current_trust_hash,
-            &invitation_id,
-            &phrase,
-            invited_role,
-            &creator,
-        )?;
-        self.append_payload(
-            EventPayload::CreateInvitation {
-                epoch_number: self.state.membership_epoch,
-                invitation_id,
-                expires_at,
-                pake_message,
-            },
-            "create SPAKE2 invitation challenge",
-        )?;
-        Ok((invitation_id, phrase))
+        if self.state.current_trust_hash != previous_hash {
+            self.values.remove(&key);
+        }
+        result
     }
 
-    fn close_invitation(&mut self, selector: &str) -> Result<()> {
-        let invitation_id = select_invitation(&self.state, selector)?.invitation_id;
-        self.append_payload(
-            EventPayload::CloseInvitation { invitation_id },
-            "close invitation",
+    fn add_connected_member(
+        &mut self,
+        requested_identity: Option<&str>,
+        name: String,
+        role: Role,
+    ) -> Result<()> {
+        let name = name.trim();
+        ensure!(!name.is_empty(), "member name cannot be empty");
+        ensure!(name.len() <= MAX_NAME_LEN, "member name is too long");
+        ensure!(!name.contains('\0'), "member name contains a NUL byte");
+        ensure!(
+            self.state
+                .member_for_signing_key(&self.identity.identity().signing_public_key)
+                .is_some_and(|member| member.role == Role::Owner),
+            "only an owner can add members"
+        );
+        let candidates = discover_identities()?
+            .into_iter()
+            .filter(|candidate| match &candidate.state {
+                IdentityState::Ready(device) => self
+                    .state
+                    .member_for_public_keys(
+                        &device.signing_public_key,
+                        &device.encryption_public_key,
+                    )
+                    .is_none(),
+                IdentityState::Provisionable => true,
+                IdentityState::Unavailable(_) => false,
+            })
+            .collect();
+        let selected = choose_identity(
+            candidates,
+            requested_identity,
+            true,
+            false,
+            "Select the physically connected identity to add",
+        )?;
+        let device = backends::provision(&selected)?;
+        let ready = DiscoveredIdentity {
+            backend: device.backend,
+            locator: device.locator.clone(),
+            display_name: device.display_name.clone(),
+            detail: format!("identity {}", device.fingerprint()),
+            state: IdentityState::Ready(device.clone()),
+        };
+        let mut new_session = backends::open(&ready)?;
+        self.add_member(
+            member_identity(&device, name.to_owned()),
+            role,
+            new_session.as_mut(),
         )
     }
 
-    fn approve_proposal(&mut self, selector: &str) -> Result<()> {
-        let proposal = select_proposal(&self.state, selector)?.clone();
-        let invitation = self
-            .state
-            .active_invitations
-            .get(&proposal.invitation_id)
-            .context("proposal invitation is no longer active")?;
+    fn add_member(
+        &mut self,
+        proposed: MemberIdentity,
+        role: Role,
+        new_session: &mut dyn IdentitySession,
+    ) -> Result<()> {
         ensure!(
-            invitation.expires_at >= now_unix(),
-            "invitation expired before this phrase proof was approved"
+            self.state.members.iter().all(|member| {
+                member.identity.signing_public_key != proposed.signing_public_key
+                    && member.identity.encryption_public_key != proposed.encryption_public_key
+            }),
+            "identity is already a trusted member or reuses a trusted key"
         );
-        ensure!(
-            invitation.creator_signing_key == self.identity.identity().signing_public_key,
-            "only the owner who created this invitation can approve its phrase proof"
-        );
-        let creator = self
-            .state
-            .member_for_signing_key(&invitation.creator_signing_key)
-            .context("invitation creator is no longer a member")?
-            .identity
-            .clone();
-        let event = find_event(&self.log, &proposal.event_hash)?;
-        let EventPayload::JoinProposal { pake_message, .. } = &event.payload else {
-            unreachable!()
-        };
-        let (session_key, invited_role) = invitation::authenticate_proposal(
-            &self.state.vault_id,
-            invitation,
-            pake_message,
-            &proposal.identity,
-            &creator,
-            self.identity.as_mut(),
-        )?;
-        ensure!(
-            self.state
-                .members
-                .iter()
-                .all(|member| member.identity.signing_public_key
-                    != proposal.identity.signing_public_key
-                    && member.identity.encryption_public_key
-                        != proposal.identity.encryption_public_key),
-            "proposal identity is already a trusted member"
-        );
+
+        let mut challenge = [0u8; 32];
+        OsRng.fill_bytes(&mut challenge);
+        print_identity_hint(new_session, IdentityOperation::Sign);
+        let signature = new_session.sign(&challenge)?;
+        ed25519_dalek::VerifyingKey::from_bytes(&proposed.signing_public_key)?
+            .verify_strict(
+                &challenge,
+                &ed25519_dalek::Signature::from_bytes(&signature),
+            )
+            .context("new identity failed signing proof")?;
+
         let epoch_number = self.state.membership_epoch + 1;
         let next_epoch_key = random_epoch_key();
-        let mut members = self
-            .state
-            .members
-            .iter()
-            .map(|member| (member.identity.clone(), member.role))
-            .collect::<Vec<_>>();
-        members.push((proposal.identity.clone(), invited_role));
-        let members = members
-            .into_iter()
-            .map(|(identity, role)| {
-                Ok(EpochMember {
-                    wrapped_epoch_key: crypto::wrap_epoch_key(
-                        &self.state.vault_id,
-                        epoch_number,
-                        &identity,
-                        &next_epoch_key,
-                    )?,
-                    identity,
-                    role,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let mut epoch = MembershipEpoch {
+        let mut members = self.state.members.clone();
+        let added = EpochMember {
+            wrapped_epoch_key: crypto::wrap_epoch_key(
+                &self.state.vault_id,
+                epoch_number,
+                &proposed,
+                &next_epoch_key,
+            )?,
+            identity: proposed,
+            role,
+        };
+        print_identity_hint(new_session, IdentityOperation::Agree);
+        let proof = unwrap_epoch_key(
+            &self.state.vault_id,
+            epoch_number,
+            &added.identity,
+            &added.wrapped_epoch_key,
+            new_session,
+        )?;
+        ensure!(
+            *proof == *next_epoch_key,
+            "new identity failed encryption proof"
+        );
+        members.push(added);
+        let epoch = MembershipEpoch {
             epoch_number,
             members,
             snapshot: crypto::encrypt_snapshot(
@@ -385,23 +333,28 @@ impl OpenVault {
                 &self.values,
                 &next_epoch_key,
             )?,
-            accepted_proposal: Some(proposal.event_hash),
-            admission_confirmation: Some([0; 32]),
         };
-        epoch.admission_confirmation = Some(invitation::admission_confirmation(
-            &session_key,
-            &self.state.vault_id,
-            &self.state.current_trust_hash,
-            &epoch,
-        )?);
-        self.append_payload(
-            EventPayload::MembershipEpoch(epoch),
-            "admit SPAKE2-authenticated member",
-        )?;
+        print_identity_hint(self.identity.as_ref(), IdentityOperation::Sign);
+        let local_checkpoint =
+            self.append_payload(EventPayload::MembershipEpoch(epoch), "add connected member");
+        if self.state.membership_epoch != epoch_number {
+            return local_checkpoint;
+        }
         self.epoch_key = next_epoch_key;
-        advance_identity_checkpoint(self.identity.as_mut(), &self.state, &self.vault_name)
-            .context("member admitted, but the hardware checkpoint was not advanced")?;
-        Ok(())
+
+        let owner_checkpoint =
+            advance_identity_checkpoint(self.identity.as_mut(), &self.state, &self.vault_name);
+        let member_checkpoint =
+            advance_identity_checkpoint(new_session, &self.state, &self.vault_name);
+        match (local_checkpoint, owner_checkpoint, member_checkpoint) {
+            (Ok(()), Ok(()), Ok(())) => Ok(()),
+            (local, owner, member) => anyhow::bail!(
+                "member was admitted, but checkpointing is incomplete (local: {}; owner: {}; new member: {}). Reconnect each affected key and reopen the vault to retry",
+                local.map_or_else(|error| format!("{error:#}"), |_| "ok".into()),
+                owner.map_or_else(|error| format!("{error:#}"), |_| "ok".into()),
+                member.map_or_else(|error| format!("{error:#}"), |_| "ok".into()),
+            ),
+        }
     }
 
     fn remove_member(&mut self, selector: &str) -> Result<()> {
@@ -475,11 +428,12 @@ impl OpenVault {
                 &self.values,
                 &next_epoch_key,
             )?,
-            accepted_proposal: None,
-            admission_confirmation: None,
         };
-        self.append_payload(EventPayload::MembershipEpoch(epoch), message)?;
-        self.epoch_key = next_epoch_key;
+        let result = self.append_payload(EventPayload::MembershipEpoch(epoch), message);
+        if self.state.membership_epoch == epoch_number {
+            self.epoch_key = next_epoch_key;
+        }
+        result?;
         advance_identity_checkpoint(self.identity.as_mut(), &self.state, &self.vault_name)
             .context("membership changed, but the hardware checkpoint was not advanced")?;
         Ok(())
@@ -497,7 +451,7 @@ impl OpenVault {
         let requires_owner = !matches!(&payload, EventPayload::Mutation { .. });
         ensure!(
             !requires_owner || member.role == Role::Owner,
-            "only an owner can manage membership and invitations"
+            "only an owner can manage membership"
         );
         let event = Event::unsigned(
             self.state.vault_id,
@@ -530,23 +484,17 @@ impl OpenVault {
             &next_log,
             message,
         )?;
-        self.repository
-            .write_local_checkpoint(&self.vault_name, &next_state.current_trust_hash)?;
         self.log = next_log;
         self.commit_oid = next_commit;
         self.state = next_state;
-        Ok(())
+        self.repository
+            .write_local_checkpoint(&self.vault_name, &self.state.current_trust_hash)
+            .context("event committed, but the local freshness checkpoint was not advanced")
     }
 
     fn run_tui(&mut self) -> Result<()> {
         require_terminal()?;
-        let invitations = self.state.active_invitations.values().cloned().collect();
-        let mut app = VaultUi::new(
-            self.values.clone(),
-            self.state.members.clone(),
-            invitations,
-            supported_proposals(&self.state),
-        );
+        let mut app = VaultUi::new(self.values.clone(), self.state.members.clone());
         let mut outputs = Vec::new();
         let result = with_terminal(|terminal| loop {
             terminal.draw(|frame| app.draw(frame, self.repository.workdir(), &self.vault_name))?;
@@ -559,9 +507,7 @@ impl OpenVault {
                 Effect::Put { .. }
                     | Effect::Delete { .. }
                     | Effect::RemoveMember { .. }
-                    | Effect::CreateInvitation { .. }
-                    | Effect::CloseInvitation { .. }
-                    | Effect::ApproveProposal { .. }
+                    | Effect::AddMember { .. }
             );
             if uses_signing_identity {
                 if let Some(hint) = self.identity.interaction_hint(IdentityOperation::Sign) {
@@ -577,11 +523,11 @@ impl OpenVault {
                 Effect::Output(value) => outputs.push(value),
                 Effect::Put { key, value } => match self.append_put(key.clone(), value.clone()) {
                     Ok(()) => app.apply_put(key, value),
-                    Err(error) => app.set_status(format!("Put not appended: {error:#}")),
+                    Err(error) => app.set_status(format!("Put failed: {error:#}")),
                 },
                 Effect::Delete { key } => match self.append_delete(key.clone()) {
                     Ok(()) => app.apply_delete(&key),
-                    Err(error) => app.set_status(format!("Delete not appended: {error:#}")),
+                    Err(error) => app.set_status(format!("Delete failed: {error:#}")),
                 },
                 Effect::RemoveMember { signing_public_key } => {
                     let previous_epoch = self.state.membership_epoch;
@@ -590,9 +536,7 @@ impl OpenVault {
                     }) {
                         Ok(()) => {
                             refresh_access_view(&mut app, &self.state);
-                            app.set_status(
-                                "Member removed; epoch key rotated; invitations invalidated",
-                            );
+                            app.set_status("Member removed; epoch key rotated");
                         }
                         Err(error) if self.state.membership_epoch > previous_epoch => {
                             refresh_access_view(&mut app, &self.state);
@@ -605,48 +549,20 @@ impl OpenVault {
                         }
                     }
                 }
-                Effect::CreateInvitation { role } => match self.create_invitation(30, 4, role) {
-                    Ok((invitation_id, mut phrase)) => {
-                        refresh_access_view(&mut app, &self.state);
-                        app.set_status(format!(
-                            "Invitation {} ({}) — share this phrase: {}",
-                            hex::encode_upper(&invitation_id[..4]),
-                            capability_name(role),
-                            phrase.as_str()
-                        ));
-                        phrase.zeroize();
-                    }
-                    Err(error) => app.set_status(format!("Invitation not created: {error:#}")),
-                },
-                Effect::CloseInvitation { invitation_id } => {
-                    let selector = hex::encode_upper(invitation_id);
-                    match self.close_invitation(&selector) {
-                        Ok(()) => {
-                            refresh_access_view(&mut app, &self.state);
-                            app.set_status("Invitation closed");
-                        }
-                        Err(error) => app.set_status(format!("Invitation not closed: {error:#}")),
-                    }
-                }
-                Effect::ApproveProposal {
-                    proposal_event_hash,
-                } => {
-                    let selector = hex::encode_upper(proposal_event_hash);
+                Effect::AddMember { role } => {
                     let previous_epoch = self.state.membership_epoch;
-                    match suspend_terminal(terminal, || self.approve_proposal(&selector)) {
+                    let result = suspend_terminal(terminal, || {
+                        let name = prompt_line("New member name: ")?;
+                        self.add_connected_member(None, name, role)
+                    });
+                    refresh_access_view(&mut app, &self.state);
+                    match result {
                         Ok(()) => {
-                            refresh_access_view(&mut app, &self.state);
-                            app.set_status(
-                                "Member admitted; epoch rotated; invitations invalidated",
-                            );
+                            app.set_status("Member added; epoch rotated and keys checkpointed")
                         }
-                        Err(error) if self.state.membership_epoch > previous_epoch => {
-                            refresh_access_view(&mut app, &self.state);
-                            app.set_status(format!(
-                                "DEGRADED SECURITY: member admitted but hardware checkpoint failed: {error:#}"
-                            ));
-                        }
-                        Err(error) => app.set_status(format!("Member not admitted: {error:#}")),
+                        Err(error) if self.state.membership_epoch > previous_epoch => app
+                            .set_status(format!("Member admitted; checkpoint pending: {error:#}")),
+                        Err(error) => app.set_status(format!("Member not added: {error:#}")),
                     }
                 }
             }
@@ -665,11 +581,14 @@ impl OpenVault {
 fn destroy_and_reprovision_identity(requested_identity: Option<&str>) -> Result<()> {
     require_terminal()?;
     let selected = choose_identity(
-        discover_identities()?,
+        discover_identities()?
+            .into_iter()
+            .filter(|identity| identity.backend == identity::IdentityBackend::YubiKey)
+            .collect(),
         requested_identity,
         true,
         true,
-        "Select the identity to destroy and replace",
+        "Select the YubiKey identity to destroy and replace",
     )?;
     eprintln!(
         "WARNING: this permanently destroys identity {} on {}. Every vault that trusts it will become inaccessible unless another member can recover it. The replacement keys will require neither a PIN nor touch, so any local process can use them while the YubiKey is connected.",
@@ -679,8 +598,7 @@ fn destroy_and_reprovision_identity(requested_identity: Option<&str>) -> Result<
     let expected = format!("DESTROY {}", selected.locator);
     let confirmation = prompt_line(&format!("Type {expected:?} to continue: "))?;
     ensure!(confirmation == expected, "identity replacement cancelled");
-    let backend = identity_backend(&selected.backend)?;
-    let replacement = backend.destroy_and_reprovision_without_user_auth(&selected)?;
+    let replacement = yubikey::destroy_and_reprovision_without_user_auth(&selected)?;
     println!(
         "Replaced {} with unprotected identity {} (PIN never; touch never).",
         replacement.display_name,
@@ -709,16 +627,15 @@ fn create_vault(
         selected.state.is_usable(),
         "selected identity is unavailable"
     );
-    let backend = identity_backend(&selected.backend)?;
-    let device = backend.provision(&selected)?;
+    let device = backends::provision(&selected)?;
     let ready = DiscoveredIdentity {
-        backend: device.backend.clone(),
+        backend: device.backend,
         locator: device.locator.clone(),
         display_name: device.display_name.clone(),
         detail: format!("identity {}", device.fingerprint()),
         state: IdentityState::Ready(device.clone()),
     };
-    let mut session = backend.open(&ready)?;
+    let mut session = backends::open(&ready)?;
     let mut vault_id = [0u8; 32];
     OsRng.fill_bytes(&mut vault_id);
     let epoch_key = random_epoch_key();
@@ -732,8 +649,6 @@ fn create_vault(
         epoch_number: 1,
         members: vec![member],
         snapshot: crypto::encrypt_snapshot(&vault_id, 1, &BTreeMap::new(), &epoch_key)?,
-        accepted_proposal: None,
-        admission_confirmation: None,
     };
     print_identity_hint(session.as_ref(), IdentityOperation::Sign);
     let genesis = Event::unsigned(
@@ -773,152 +688,7 @@ fn run_interactive_existing(
     stored: StoredLog,
     requested_identity: Option<&str>,
 ) -> Result<()> {
-    let state = derive_with_checkpoints(repository, vault_name, &stored.log, None)?;
-    ensure!(
-        state.fork.is_none(),
-        "cannot open a vault with an unresolved trusted fork"
-    );
-    let choices = discover_identities()?
-        .into_iter()
-        .map(|mut identity| {
-            let access = match &identity.state {
-                IdentityState::Ready(device) => state
-                    .member_for_public_keys(
-                        &device.signing_public_key,
-                        &device.encryption_public_key,
-                    )
-                    .map(|member| format!("trusted {}", capability_name(member.role)))
-                    .unwrap_or_else(|| "not trusted; invitation onboarding available".into()),
-                IdentityState::Provisionable => {
-                    "not provisioned; invitation onboarding available".into()
-                }
-                IdentityState::Unavailable(_) => "unavailable; not trusted".into(),
-            };
-            identity.detail = format!("{} — {access}", identity.detail);
-            identity
-        })
-        .collect::<Vec<_>>();
-    let selected = choose_identity(
-        choices,
-        requested_identity,
-        true,
-        true,
-        "Select an identity",
-    )?;
-    ensure!(
-        selected.state.is_usable(),
-        "selected identity is unavailable"
-    );
-    let selector = selected.selector();
-    if let IdentityState::Ready(device) = &selected.state {
-        if let Some(final_hash) =
-            admitted_local_proposal(repository, vault_name, &stored, &state, device)
-        {
-            let mut vault = confirm_access(
-                repository,
-                vault_name,
-                stored,
-                Some(&selector),
-                &hex::encode_upper(final_hash),
-            )?;
-            return vault.run_tui();
-        }
-        if state
-            .member_for_public_keys(&device.signing_public_key, &device.encryption_public_key)
-            .is_some()
-        {
-            let mut vault = unlock_vault(repository, vault_name, stored, Some(&selector))?;
-            return vault.run_tui();
-        }
-        let matching = state
-            .pending_proposals
-            .iter()
-            .filter(|proposal| {
-                proposal.identity.signing_public_key == device.signing_public_key
-                    && proposal.identity.encryption_public_key == device.encryption_public_key
-            })
-            .collect::<Vec<_>>();
-        if let Some(proposal) = matching.first() {
-            println!(
-                "Phrase proof {} is waiting for an owner to verify and admit it.",
-                hex::encode_upper(&proposal.event_hash[..8])
-            );
-            return Ok(());
-        }
-    }
-
-    let supported_invitations = state
-        .active_invitations
-        .values()
-        .filter(|invitation| invitation::is_spake2_invitation(&invitation.pake_message))
-        .collect::<Vec<_>>();
-    ensure!(
-        !supported_invitations.is_empty(),
-        "this identity is not trusted and the vault has no active SPAKE2 invitation; close obsolete invitations and create a new one"
-    );
-    let invitation_selector = choose_option(
-        supported_invitations
-            .into_iter()
-            .map(|invitation| {
-                let id = hex::encode_upper(invitation.invitation_id);
-                (
-                    id.clone(),
-                    format!("{id}  expires {}", invitation.expires_at),
-                )
-            })
-            .collect(),
-        "Select an invitation",
-    )?;
-    let default_name = selected.display_name.clone();
-    let entered_name = prompt_line(&format!("Member name [{default_name}]: "))?;
-    let name = if entered_name.is_empty() {
-        default_name
-    } else {
-        entered_name
-    };
-    request_access(
-        repository,
-        vault_name,
-        stored,
-        Some(&selector),
-        &invitation_selector,
-        &name,
-        false,
-    )
-}
-
-fn admitted_local_proposal(
-    repository: &GitRepository,
-    vault_name: &str,
-    stored: &StoredLog,
-    state: &TrustedState,
-    device: &DeviceIdentity,
-) -> Option<Hash> {
-    stored.log.events.iter().rev().find_map(|event| {
-        if !state
-            .trusted_event_hashes
-            .contains(&event.event_hash().ok()?)
-        {
-            return None;
-        }
-        let EventPayload::MembershipEpoch(epoch) = &event.payload else {
-            return None;
-        };
-        let proposal_hash = epoch.accepted_proposal?;
-        let proposal = find_event(&stored.log, &proposal_hash).ok()?;
-        let EventPayload::JoinProposal { identity, .. } = &proposal.payload else {
-            return None;
-        };
-        if identity.signing_public_key != device.signing_public_key
-            || identity.encryption_public_key != device.encryption_public_key
-            || repository
-                .read_onboarding_state(vault_name, &proposal_hash)
-                .is_err()
-        {
-            return None;
-        }
-        Some(proposal_hash)
-    })
+    unlock_vault(repository, vault_name, stored, requested_identity)?.run_tui()
 }
 
 fn unlock_vault(
@@ -978,8 +748,7 @@ fn unlock_vault(
         "{} is not a trusted member of this vault",
         device.display_name
     );
-    let backend = identity_backend(&selected.backend)?;
-    let mut identity = backend.open(&selected)?;
+    let mut identity = backends::open(&selected)?;
     let hardware_checkpoint = identity.read_trust_record(vault_name)?;
     let state = derive_with_checkpoints(
         repository,
@@ -1018,245 +787,6 @@ fn unlock_vault(
         epoch_key,
         identity,
     })
-}
-
-fn request_access(
-    repository: &GitRepository,
-    vault_name: &str,
-    stored: StoredLog,
-    requested_identity: Option<&str>,
-    invitation_selector: &str,
-    name: &str,
-    phrase_stdin: bool,
-) -> Result<()> {
-    let state = derive_with_checkpoints(repository, vault_name, &stored.log, None)?;
-    ensure!(
-        state.fork.is_none(),
-        "cannot request access while a trusted fork is unresolved"
-    );
-    let invitation = select_invitation(&state, invitation_selector)?.clone();
-    ensure!(
-        invitation.expires_at >= now_unix(),
-        "invitation has expired"
-    );
-    let selected = choose_identity(
-        discover_identities()?,
-        requested_identity,
-        true,
-        true,
-        "Select an identity for the access request",
-    )?;
-    ensure!(
-        selected.state.is_usable(),
-        "selected identity is unavailable"
-    );
-    let backend = identity_backend(&selected.backend)?;
-    let device = backend.provision(&selected)?;
-    let ready = DiscoveredIdentity {
-        backend: device.backend.clone(),
-        locator: device.locator.clone(),
-        display_name: device.display_name.clone(),
-        detail: format!("identity {}", device.fingerprint()),
-        state: IdentityState::Ready(device.clone()),
-    };
-    let mut identity = backend.open(&ready)?;
-    let proposed = member_identity(&device, name.to_owned());
-    let mut phrase = read_phrase(phrase_stdin)?;
-    let (phrase_proof, session_key) =
-        invitation::start_proposal(&state.vault_id, &invitation, &proposed, &phrase)?;
-    phrase.zeroize();
-    print_identity_hint(identity.as_ref(), IdentityOperation::Sign);
-    let event = Event::unsigned(
-        state.vault_id,
-        state.current_trust_hash,
-        device.signing_public_key,
-        EventPayload::JoinProposal {
-            invitation_id: invitation.invitation_id,
-            identity: proposed.clone(),
-            pake_message: phrase_proof,
-        },
-    )
-    .sign(identity.as_mut())?;
-    let event_hash = event.event_hash()?;
-    append_candidate(
-        repository,
-        vault_name,
-        stored,
-        event,
-        "submit SPAKE2 invitation phrase proof",
-    )?;
-    let session_state = ClientSessionState {
-        invitation_id: invitation.invitation_id,
-        invitation_event_hash: invitation.create_event_hash,
-        final_proposal_hash: event_hash,
-        proposal_identity: proposed,
-        session_key,
-    };
-    let mut encoded = invitation::seal_client_session_state(
-        &state.vault_id,
-        state.membership_epoch,
-        &session_state,
-    )?;
-    repository.write_onboarding_state(vault_name, &event_hash, &encoded)?;
-    encoded.zeroize();
-    println!("{}", hex::encode_upper(event_hash));
-    eprintln!(
-        "Invitation phrase proof submitted. Next: the owner must run `git vault {vault_name} approve {}` to verify and admit this member.",
-        hex::encode_upper(&event_hash[..8])
-    );
-    Ok(())
-}
-
-fn confirm_access(
-    repository: &GitRepository,
-    vault_name: &str,
-    stored: StoredLog,
-    requested_identity: Option<&str>,
-    proposal_selector: &str,
-) -> Result<OpenVault> {
-    let final_event = select_event(&stored.log, proposal_selector, |event| {
-        matches!(event.payload, EventPayload::JoinProposal { .. })
-    })?;
-    let final_hash = final_event.event_hash()?;
-    let EventPayload::JoinProposal {
-        identity: proposal_identity,
-        ..
-    } = &final_event.payload
-    else {
-        unreachable!()
-    };
-    let selected = choose_identity(
-        discover_identities()?,
-        requested_identity,
-        false,
-        true,
-        "Select the newly admitted identity",
-    )?;
-    let IdentityState::Ready(device) = &selected.state else {
-        bail!("selected identity is not provisioned");
-    };
-    ensure!(
-        device.signing_public_key == proposal_identity.signing_public_key
-            && device.encryption_public_key == proposal_identity.encryption_public_key,
-        "selected identity is not the proposed identity"
-    );
-    let backend = identity_backend(&selected.backend)?;
-    let mut identity = backend.open(&selected)?;
-    let mut local = Zeroizing::new(repository.read_onboarding_state(vault_name, &final_hash)?);
-    print_identity_hint(identity.as_ref(), IdentityOperation::Agree);
-    let session = invitation::open_client_session_state(
-        &final_event.vault_id,
-        &final_hash,
-        proposal_identity,
-        &local,
-        identity.as_mut(),
-    )?;
-    local.zeroize();
-    let state = derive_with_checkpoints(repository, vault_name, &stored.log, None)?;
-    let admission_event = stored
-        .log
-        .events
-        .iter()
-        .find(|event| {
-            state
-                .trusted_event_hashes
-                .contains(&event.event_hash().unwrap_or([0; 32]))
-                && matches!(
-                    &event.payload,
-                    EventPayload::MembershipEpoch(epoch)
-                        if epoch.accepted_proposal == Some(final_hash)
-                )
-        })
-        .context("the proposal has not been admitted by a trusted owner")?;
-    let EventPayload::MembershipEpoch(epoch) = &admission_event.payload else {
-        unreachable!()
-    };
-    invitation::verify_admission_confirmation(
-        &session.session_key,
-        &state.vault_id,
-        &admission_event.parent_trust_hash,
-        epoch,
-    )?;
-    ensure!(
-        state
-            .member_for_public_keys(
-                &session.proposal_identity.signing_public_key,
-                &session.proposal_identity.encryption_public_key,
-            )
-            .is_some(),
-        "admission event did not add the proposed identity"
-    );
-    let member = state
-        .member_for_public_keys(&device.signing_public_key, &device.encryption_public_key)
-        .context("admitted identity is absent from the current membership epoch")?;
-    print_identity_hint(identity.as_ref(), IdentityOperation::Agree);
-    let epoch_key = unwrap_epoch_key(
-        &state.vault_id,
-        state.membership_epoch,
-        &member.identity,
-        &member.wrapped_epoch_key,
-        identity.as_mut(),
-    )?;
-    let values = state.unlock_values(&epoch_key)?;
-    advance_identity_checkpoint(identity.as_mut(), &state, vault_name)
-        .context("admission verified, but the hardware checkpoint was not advanced")?;
-    repository.write_local_checkpoint(vault_name, &state.current_trust_hash)?;
-    repository.delete_onboarding_state(vault_name, &final_hash)?;
-    eprintln!(
-        "Admission confirmed for {}.",
-        session.proposal_identity.name
-    );
-    Ok(OpenVault {
-        repository: repository.clone(),
-        vault_name: vault_name.into(),
-        commit_oid: stored.commit_oid,
-        log: stored.log,
-        state,
-        values,
-        epoch_key,
-        identity,
-    })
-}
-
-fn append_candidate(
-    repository: &GitRepository,
-    vault_name: &str,
-    stored: StoredLog,
-    event: Event,
-    message: &str,
-) -> Result<StoredLog> {
-    let before = derive_trusted_state(&stored.log.events, &DeriveOptions::default())?;
-    ensure!(
-        before.fork.is_none(),
-        "cannot append while a trusted fork is unresolved"
-    );
-    ensure!(
-        event.vault_id == before.vault_id,
-        "candidate event is for another vault"
-    );
-    let mut log = stored.log.clone();
-    log.append(event)?;
-    let after = derive_trusted_state(&log.events, &DeriveOptions::default())?;
-    ensure!(
-        after.current_trust_hash == before.current_trust_hash && after.fork.is_none(),
-        "untrusted candidate unexpectedly changed the trusted projection"
-    );
-    let commit_oid =
-        repository.append_vault_log(vault_name, Some(&stored.commit_oid), &log, message)?;
-    Ok(StoredLog { commit_oid, log })
-}
-
-fn read_phrase(stdin: bool) -> Result<Zeroizing<String>> {
-    let phrase = if stdin {
-        read_stdin_value("invitation phrase")?
-    } else {
-        Zeroizing::new(
-            rpassword::prompt_password("Invitation phrase: ")
-                .context("failed to read invitation phrase")?,
-        )
-    };
-    invitation::validate_phrase(&phrase)?;
-    Ok(phrase)
 }
 
 fn advance_identity_checkpoint(
@@ -1334,11 +864,9 @@ fn print_verification(stored: &StoredLog, state: &TrustedState) {
         hex::encode_upper(state.current_trust_hash)
     );
     println!("membership epoch   {}", state.membership_epoch);
-    println!("projection level   {:?}", state.validation);
     println!("trusted events     {}", state.trusted_event_hashes.len());
     println!("raw valid events   {}", stored.log.events.len());
     println!("invalid records    {}", stored.log.diagnostics.len());
-    println!("pending proposals  {}", state.pending_proposals.len());
     println!(
         "fork               {}",
         if state.fork.is_some() { "yes" } else { "no" }
@@ -1349,91 +877,7 @@ fn print_verification(stored: &StoredLog, state: &TrustedState) {
 }
 
 fn refresh_access_view(app: &mut VaultUi, state: &TrustedState) {
-    app.refresh_access(
-        state.members.clone(),
-        state.active_invitations.values().cloned().collect(),
-        supported_proposals(state),
-    );
-}
-
-fn supported_proposals(state: &TrustedState) -> Vec<crate::state::PendingProposal> {
-    state
-        .pending_proposals
-        .iter()
-        .filter(|proposal| {
-            state
-                .active_invitations
-                .get(&proposal.invitation_id)
-                .is_some_and(|invitation| {
-                    invitation::is_spake2_invitation(&invitation.pake_message)
-                })
-        })
-        .cloned()
-        .collect()
-}
-
-fn select_invitation<'a>(
-    state: &'a TrustedState,
-    selector: &str,
-) -> Result<&'a crate::state::InvitationState> {
-    let normalized = selector.to_ascii_uppercase();
-    let matches = state
-        .active_invitations
-        .values()
-        .filter(|invitation| hex::encode_upper(invitation.invitation_id).starts_with(&normalized))
-        .collect::<Vec<_>>();
-    match matches.as_slice() {
-        [invitation] => Ok(*invitation),
-        [] => bail!("no active invitation matches {selector:?}"),
-        _ => bail!("invitation selector {selector:?} is ambiguous"),
-    }
-}
-
-fn select_proposal<'a>(
-    state: &'a TrustedState,
-    selector: &str,
-) -> Result<&'a crate::state::PendingProposal> {
-    let normalized = selector.to_ascii_uppercase();
-    let matches = state
-        .pending_proposals
-        .iter()
-        .filter(|proposal| hex::encode_upper(proposal.event_hash).starts_with(&normalized))
-        .collect::<Vec<_>>();
-    match matches.as_slice() {
-        [proposal] => Ok(*proposal),
-        [] => bail!("no join proposal matches {selector:?}"),
-        _ => bail!("proposal selector {selector:?} is ambiguous"),
-    }
-}
-
-fn select_event<'a>(
-    log: &'a EventLog,
-    selector: &str,
-    predicate: impl Fn(&Event) -> bool,
-) -> Result<&'a Event> {
-    let normalized = selector.to_ascii_uppercase();
-    let matches = log
-        .events
-        .iter()
-        .filter(|event| {
-            predicate(event)
-                && event
-                    .event_hash()
-                    .is_ok_and(|hash| hex::encode_upper(hash).starts_with(&normalized))
-        })
-        .collect::<Vec<_>>();
-    match matches.as_slice() {
-        [event] => Ok(*event),
-        [] => bail!("no event matches {selector:?}"),
-        _ => bail!("event selector {selector:?} is ambiguous"),
-    }
-}
-
-fn find_event<'a>(log: &'a EventLog, hash: &Hash) -> Result<&'a Event> {
-    log.events
-        .iter()
-        .find(|event| event.event_hash().ok().as_ref() == Some(hash))
-        .context("referenced event is absent from the log")
+    app.refresh_access(state.members.clone());
 }
 
 fn select_member_index(members: &[EpochMember], selector: &str) -> Result<usize> {
@@ -1456,7 +900,7 @@ fn select_member_index(members: &[EpochMember], selector: &str) -> Result<usize>
 
 fn capability_name(role: Role) -> &'static str {
     match role {
-        Role::Reader => "member: read/write",
+        Role::Member => "member: read/write",
         Role::Owner => "owner: read/write + access management",
     }
 }
@@ -1501,13 +945,6 @@ fn print_identity_hint(identity: &dyn IdentitySession, operation: IdentityOperat
     }
 }
 
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 #[cfg(test)]
 mod integration_tests {
     use std::process::Command as ProcessCommand;
@@ -1515,7 +952,41 @@ mod integration_tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::{backends::test_identity::TestIdentityBackend, identity::IdentityBackend};
+    use crate::backends::test_identity::TestIdentityBackend;
+
+    struct FailCheckpointOnce {
+        inner: Box<dyn IdentitySession>,
+        fail: bool,
+    }
+
+    impl IdentitySession for FailCheckpointOnce {
+        fn identity(&self) -> &DeviceIdentity {
+            self.inner.identity()
+        }
+
+        fn sign(&mut self, message: &[u8; 32]) -> Result<[u8; 64]> {
+            self.inner.sign(message)
+        }
+
+        fn agree(&mut self, peer_public_key: &[u8; 32]) -> Result<[u8; 32]> {
+            self.inner.agree(peer_public_key)
+        }
+
+        fn read_trust_record(
+            &mut self,
+            vault_name: &str,
+        ) -> Result<Option<identity::VaultTrustRecord>> {
+            self.inner.read_trust_record(vault_name)
+        }
+
+        fn write_trust_record(&mut self, record: &identity::VaultTrustRecord) -> Result<()> {
+            if self.fail {
+                self.fail = false;
+                anyhow::bail!("simulated interrupted checkpoint write");
+            }
+            self.inner.write_trust_record(record)
+        }
+    }
 
     #[test]
     fn trusted_put_and_delete_append_to_custom_git_ref() {
@@ -1527,9 +998,8 @@ mod integration_tests {
             .unwrap();
         let repository = GitRepository::discover(directory.path()).unwrap();
         let backend = TestIdentityBackend::from_seed(21, "alice");
-        let discovered = backend.discovered();
-        let device = backend.provision(&discovered).unwrap();
-        let mut identity = backend.open(&discovered).unwrap();
+        let device = backend.device();
+        let mut identity = backend.open();
         let vault_id = [42; 32];
         let epoch_key = random_epoch_key();
         let public = member_identity(&device, "Alice".into());
@@ -1542,8 +1012,6 @@ mod integration_tests {
                 role: Role::Owner,
             }],
             snapshot: crypto::encrypt_snapshot(&vault_id, 1, &BTreeMap::new(), &epoch_key).unwrap(),
-            accepted_proposal: None,
-            admission_confirmation: None,
         };
         let genesis = Event::unsigned(
             vault_id,
@@ -1616,7 +1084,7 @@ mod integration_tests {
     }
 
     #[test]
-    fn spake2_phrase_proof_is_inert_until_owner_admission_epoch() {
+    fn physically_present_identity_is_proved_and_added_in_one_event() {
         let directory = TempDir::new().unwrap();
         ProcessCommand::new("git")
             .args(["init", "--quiet"])
@@ -1625,9 +1093,8 @@ mod integration_tests {
             .unwrap();
         let repository = GitRepository::discover(directory.path()).unwrap();
         let alice_backend = TestIdentityBackend::from_seed(31, "alice");
-        let alice_discovered = alice_backend.discovered();
-        let alice_device = alice_backend.provision(&alice_discovered).unwrap();
-        let mut alice = alice_backend.open(&alice_discovered).unwrap();
+        let alice_device = alice_backend.device();
+        let mut alice = alice_backend.open();
         let vault_id = [52; 32];
         let epoch_key = random_epoch_key();
         let alice_member = member_identity(&alice_device, "Alice".into());
@@ -1640,8 +1107,6 @@ mod integration_tests {
                 role: Role::Owner,
             }],
             snapshot: crypto::encrypt_snapshot(&vault_id, 1, &BTreeMap::new(), &epoch_key).unwrap(),
-            accepted_proposal: None,
-            admission_confirmation: None,
         };
         let genesis = Event::unsigned(
             vault_id,
@@ -1661,7 +1126,7 @@ mod integration_tests {
             .write_local_checkpoint("onboard", &state.current_trust_hash)
             .unwrap();
         let mut vault = OpenVault {
-            repository: repository.clone(),
+            repository,
             vault_name: "onboard".into(),
             commit_oid,
             log,
@@ -1670,86 +1135,42 @@ mod integration_tests {
             epoch_key,
             identity: alice,
         };
-        let (_, phrase) = vault.create_invitation(30, 4, Role::Owner).unwrap();
-        let invitation = vault
-            .state
-            .active_invitations
-            .values()
-            .next()
-            .unwrap()
-            .clone();
 
         let bob_backend = TestIdentityBackend::from_seed(32, "bob");
-        let bob_discovered = bob_backend.discovered();
-        let bob_device = bob_backend.provision(&bob_discovered).unwrap();
-        let mut bob = bob_backend.open(&bob_discovered).unwrap();
-        let bob_member = member_identity(&bob_device, "Bob".into());
-        let (phrase_proof, client_session_key) =
-            invitation::start_proposal(&vault_id, &invitation, &bob_member, &phrase).unwrap();
-        let proposal = Event::unsigned(
-            vault_id,
-            vault.state.current_trust_hash,
-            bob_device.signing_public_key,
-            EventPayload::JoinProposal {
-                invitation_id: invitation.invitation_id,
-                identity: bob_member,
-                pake_message: phrase_proof,
-            },
-        )
-        .sign(bob.as_mut())
-        .unwrap();
-        let final_hash = proposal.event_hash().unwrap();
-        let stored = append_candidate(
-            &repository,
-            "onboard",
-            StoredLog {
-                commit_oid: vault.commit_oid.clone(),
-                log: vault.log.clone(),
-            },
-            proposal,
-            "submit phrase proof",
-        )
-        .unwrap();
-        vault.commit_oid = stored.commit_oid;
-        vault.log = stored.log;
-        vault.state = derive_trusted_state(&vault.log.events, &DeriveOptions::default()).unwrap();
-        assert_eq!(vault.state.members.len(), 1);
+        let bob_device = bob_backend.device();
+        let mut bob = FailCheckpointOnce {
+            inner: bob_backend.open(),
+            fail: true,
+        };
+        let error = vault
+            .add_member(
+                member_identity(&bob_device, "Bob".into()),
+                Role::Owner,
+                &mut bob,
+            )
+            .unwrap_err();
 
-        vault
-            .approve_proposal(&hex::encode_upper(final_hash))
-            .unwrap();
-        assert_eq!(vault.state.members.len(), 2);
+        assert!(error.to_string().contains("checkpointing is incomplete"));
+        assert_eq!(vault.state.membership_epoch, 2);
+        assert_eq!(vault.log.events.len(), 2);
         assert_eq!(
             vault
                 .state
                 .member_for_public_keys(
                     &bob_device.signing_public_key,
-                    &bob_device.encryption_public_key
+                    &bob_device.encryption_public_key,
                 )
                 .map(|member| member.role),
             Some(Role::Owner)
         );
-        let admission = vault
-            .log
-            .events
-            .iter()
-            .find(|event| {
-                matches!(
-                    &event.payload,
-                    EventPayload::MembershipEpoch(epoch)
-                        if epoch.accepted_proposal == Some(final_hash)
-                )
-            })
-            .unwrap();
-        let EventPayload::MembershipEpoch(epoch) = &admission.payload else {
-            unreachable!()
-        };
-        invitation::verify_admission_confirmation(
-            &client_session_key,
-            &vault_id,
-            &admission.parent_trust_hash,
-            epoch,
-        )
-        .unwrap();
+
+        advance_identity_checkpoint(&mut bob, &vault.state, "onboard").unwrap();
+        assert_eq!(
+            bob.read_trust_record("onboard")
+                .unwrap()
+                .unwrap()
+                .membership_epoch,
+            2
+        );
     }
 }

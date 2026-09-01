@@ -22,7 +22,7 @@ The interactive vault TUI derives a verified trusted projection, unlocks the cur
 
 Successful secret edits immediately append immutable, signed events.
 
-> **Early security prototype:** deterministic trusted replay, encrypted mutations, Git event-set merging, persistent YubiKey membership checkpoints, Ed25519/X25519 hardware identities, and SPAKE2 onboarding are implemented and tested. The selected Rust SPAKE2 implementation has not received an independent audit, and the YubiKey checkpoint object still needs broader power-loss/endurance testing. Do not use this as the only copy of important secrets.
+> **Early security prototype:** deterministic trusted replay, encrypted mutations, Git event-set merging, persistent YubiKey membership checkpoints, Ed25519/X25519 hardware identities, and physical-presence onboarding are implemented and tested. The YubiKey checkpoint object still needs broader power-loss/endurance testing. Do not use this as the only copy of important secrets.
 
 ## Storage model
 
@@ -41,12 +41,11 @@ Additional refs are isolated by purpose:
 ```text
 refs/vault-remotes/<remote>/<vault>   fetched, untrusted remote state
 refs/vault-local/<vault>              local freshness checkpoint object
-refs/vault-onboarding/<vault>/<event> requester-only PAKE session state
 ```
 
 Git stores, synchronizes, and retains history. Git commits, authors, timestamps, and ancestry do not decide event authorization.
 
-Nuking through the manager removes the selected vault's local `refs/vaults/*`, freshness, onboarding, and staged remote refs. It does not delete a remote repository's vault ref, and unreachable Git objects may remain recoverable until Git garbage collection. This is ref deletion, not guaranteed forensic erasure.
+Nuking through the manager removes the selected vault's local `refs/vaults/*`, freshness, and staged remote refs. It does not delete a remote repository's vault ref, and unreachable Git objects may remain recoverable until Git garbage collection. This is ref deletion, not guaranteed forensic erasure.
 
 ## Trust model
 
@@ -65,8 +64,6 @@ The code distinguishes:
 
 - **Structurally valid:** canonical fields and lengths are valid and the Ed25519 signature verifies.
 - **Trusted event:** the event extends the current trust hash and its signer was authorized for that event type by the previous trusted state.
-
-Join proposals remain structurally valid but inert until the invitation creator verifies SPAKE2 confirmation and signs the exact admission epoch.
 
 Structurally valid but unauthorized events remain inert. A removed member can continue appending mathematically valid signatures, but those events cannot extend the trusted state.
 
@@ -94,10 +91,10 @@ Capabilities are intentionally minimal:
 
 ```text
 member   read and write secrets
-owner    read and write secrets, plus manage invitations and membership
+owner    read and write secrets, plus manage membership
 ```
 
-Every trusted member is a secret reader/writer. Multiple owners are supported. The internal `reader` role code is presented to users as `member` for compatibility with existing event encoding.
+Every trusted member is a secret reader/writer. Multiple owners are supported.
 
 ## Hardware identity
 
@@ -108,17 +105,21 @@ PIV slot 82   X25519 encryption/key agreement
 PIV slot 83   Ed25519 event signing
 ```
 
-Private keys remain on the device. Normal provisioning uses PIN-once with touch-always for X25519 and touch-cached for Ed25519. Application code uses generic identity traits so software identities can exercise the security-critical replay and crypto code in tests.
+Private keys remain on the device. Normal provisioning uses PIN-once with touch-always for X25519 and touch-cached for Ed25519. Identity sessions keep the replay and crypto code independent of the local key mechanism.
 
 PIN and touch policies are immutable after PIV key generation. An explicit destructive replacement can generate both keys with `PIN never` and `touch never`:
 
 ```sh
-git vault <vault> destroy-identity --identity yubikey:<serial>
+git vault <vault> destroy-identity --identity <serial>
 ```
 
 The command requires typing `DESTROY <serial>` and authenticating with the PIV management key. It destroys the old permanent identity and clears its hardware checkpoints; existing vault refs are deliberately left untouched. Any vault that trusted only the destroyed identity becomes inaccessible and must be recovered by another member or nuked and recreated. With neither PIN nor touch, any local process can use the connected YubiKey to decrypt and sign.
 
-The stable member identity is the Ed25519/X25519 public-key pair—not a serial number, Git identity, or certificate fingerprint. YubiKey serials are only local backend locators.
+On macOS, `--identity touchid` creates or opens one Ed25519/X25519 identity stored in the login Keychain. The CLI requests Touch ID through LocalAuthentication before loading the private keys, but unlike a YubiKey or a future Secure Enclave implementation, those keys enter application memory while the vault is open.
+
+This easy path uses an application-enforced biometric check because biometric Keychain ACLs require signing entitlements unavailable to a plain `cargo install` binary. A local process with independent access to the user's unlocked Keychain can bypass that check. The public identity and rollback checkpoints are separate Keychain items so identities can be listed without a biometric prompt; those checkpoints detect ordinary rollback but are not independent hardware anchors.
+
+The stable member identity is the Ed25519/X25519 public-key pair—not a serial number, Git identity, or certificate fingerprint. YubiKey serials and `touchid` are only local locators.
 
 The current signed event format carries only the permanent Ed25519/X25519 public-key pair; it does not reserve an unused certificate field or define a general PKI.
 
@@ -133,7 +134,8 @@ git vault prod
 With multiple identities:
 
 ```sh
-git vault prod --identity yubikey:33127878
+git vault prod --identity 33127878
+git vault prod --identity touchid
 ```
 
 Stable commands are available for automation:
@@ -147,11 +149,8 @@ git vault prod set ENABLED --type boolean
 git vault prod set KEY_BYTES --type bytes
 git vault prod delete TOKEN
 git vault prod members
-git vault prod invite --minutes 30 --words 4 --capability member
-git vault prod invite --minutes 30 --words 4 --capability owner
-git vault prod request-access <invitation> --name Bob
-git vault prod approve <phrase-proof>
-git vault prod confirm-access <phrase-proof>
+git vault prod add-member --name Bob --new-identity <serial|touchid> --capability member
+git vault prod add-member --name Bob --new-identity <serial|touchid> --capability owner
 git vault prod remove-member <name-or-fingerprint>
 git vault prod set-role <name-or-fingerprint> member
 git vault prod verify
@@ -183,47 +182,24 @@ Push never forces the remote vault ref. Fetch first writes only to:
 refs/vault-remotes/origin/prod
 ```
 
-The fetched event set is parsed and unioned with the local set by event hash. The merged set is replayed, forks and rollback are checked, and a two-parent Git commit preserves both local and remote histories. Concurrent inert proposals therefore coexist, and a remote omission cannot delete a local event.
+The fetched event set is parsed and unioned with the local set by event hash. The merged set is replayed, forks and rollback are checked, and a two-parent Git commit preserves both local and remote histories. A remote omission cannot delete a local event.
 
-Never configure `refs/vault-local/*` or `refs/vault-onboarding/*` for pushing. They contain local freshness and requester continuation state, respectively.
+Never configure `refs/vault-local/*` for pushing. It contains the local freshness checkpoint.
 
-## Invitations and membership management
+## Physical-presence membership management
 
-The binary event model uses immutable `CreateInvitation`, `CloseInvitation`, and `JoinProposal` records. `git-vault` uses RustCrypto `spake2` 0.4 with Ed25519-group parameters and explicit HMAC key confirmation. This crate warns that it has not received an independent third-party audit; the decision and limits are recorded in [`docs/pake-review.md`](docs/pake-review.md).
+Adding a member is synchronous: an existing owner key and the new key must both be connected to the same machine. The new key is provisioned if needed, proves possession of its Ed25519 signing key, and unwraps the next X25519-wrapped epoch key before admission. The owner then signs one `MembershipEpoch` event containing the exact new identity, name, capability, encrypted snapshot, and wrapped epoch keys.
 
-The user-visible exchange is:
+The membership event is committed only after both local key proofs succeed. The owner and new key checkpoints are then written and reread. If the Git commit succeeds but either checkpoint update fails, the member is already admitted; reconnect the affected key and reopen the vault. Opening verifies the committed lineage and retries any missing or older checkpoint rather than creating another membership event.
 
-1. **Owner:** create an invitation challenge and share its four-word phrase.
-2. **Requester:** select the invitation, enter the phrase, and submit a signed phrase proof.
-3. **Owner:** verify that proof and sign the membership admission.
-4. **Requester:** automatically verify the exact admission epoch when it next opens the vault.
-
-The owner chooses `member` or `owner` capability when creating the invitation. That capability is signed into the invitation, bound into requester key confirmation, enforced by trusted replay, and covered by the requester's final admission confirmation.
-
-The owner's resumable SPAKE2 state is encrypted only to the invitation creator's X25519 YubiKey identity, and only that owner may admit its proposal. The public Git transcript provides no passive offline phrase verifier. Requester session keys under `refs/vault-onboarding/*` are likewise encrypted to the requester's permanent X25519 identity.
-
-When participants use different clones, they run `git vault <name> push`/`fetch` between these append steps. The PAKE protocol itself is transport-independent. In interactive mode, selecting an untrusted or provisionable YubiKey starts or resumes this invitation workflow instead of attempting to unlock the vault as a trusted member.
-
-SPAKE2 identities, requester confirmation, and admission confirmation bind:
-
-```text
-vault ID
-invitation ID
-proposed Ed25519/X25519 identity
-new membership epoch
-trusted membership hash
-```
-
-A phrase proof remains inert until the invitation creator verifies it and signs the membership epoch referencing that exact immutable proposal. A wrong phrase produces a different SPAKE2 key and fails requester confirmation. Each active owner verification permits one online phrase guess; the public transcript does not permit passive offline guessing.
-
-Wall-clock time is never an input to trusted replay. Expiry blocks new requests and owner approval only at interaction time; an admission remains permanently valid after its invitation expires. Expired invitations stay explicitly open—and count toward the invitation limit—until an owner signs `CloseInvitation`; the TUI labels them for closure.
+Trusted replay authorizes the change from the existing owner's signature. Physical presence is an enforced local interaction, not an asynchronous event transcript.
 
 ## Rollback anchors
 
 Two independent mechanisms are designed:
 
 - `refs/vault-local/<vault>` detects ordinary trusted-state rollback on a machine that has previously accepted a newer state.
-- A management-key-authenticated YubiKey trust object anchors the newest accepted membership epoch outside rollbackable Git.
+- A management-key-authenticated YubiKey trust object anchors the newest accepted membership epoch outside rollbackable Git. Touch ID identities instead use the weaker local Keychain checkpoint described above.
 
 The YubiKey stores up to 16 canonically ordered vault-name/checkpoint records in PIV object `5FC10E`; it never silently evicts one. Creating a vault or accepting a newer membership epoch requires persisting and rereading this checkpoint. Failure aborts acceptance with a prominent error. This binds a familiar vault name to its permanent vault ID, membership event, and trust hash, so a replacement repository cannot silently establish another Genesis for that name.
 
@@ -231,19 +207,19 @@ The management key is requested through the controlling terminal for checkpoint 
 
 ## Binary format and limits
 
-The current prototype format uses `GVLOG003`/`GVEVT003`. The explicit binary codec is versioned, length-delimited, canonical, and independently frames each event. Prototype formats are not migrated or accepted as legacy input.
+The current prototype format uses `GVLOG005`/`GVEVT005`. The explicit binary codec is versioned, length-delimited, canonical, and independently frames each event. Prototype formats are not migrated or accepted as legacy input.
 
 ```text
 log magic
 event length
 event magic + version
-vault ID + event ID + type
+vault ID + event type
 parent trust hash + author signing key
 bounded canonical payload
 Ed25519 signature
 ```
 
-Unknown event types are structurally parseable but inert. Trailing fields, truncation, malformed payloads, invalid signatures, and oversized records are rejected or diagnosed without granting trust. Duplicate display event IDs are diagnostic only; event hashes are the immutable set identity.
+Unknown event types, trailing fields, truncation, malformed payloads, invalid signatures, and oversized records are rejected or diagnosed without granting trust. Event hashes are the immutable set identity.
 
 Hard limits include:
 
@@ -251,9 +227,7 @@ Hard limits include:
 - 20 MiB event;
 - 16 MiB value/snapshot;
 - 64 members;
-- 32 active invitations;
-- 128 pending proposals;
-- bounded encrypted mutations, names, and PAKE messages.
+- bounded encrypted mutations and names.
 
 A writer can still cause storage or download denial of service. Cryptography makes unauthorized data inert, not free.
 
@@ -262,17 +236,20 @@ A writer can still cause storage or download denial of service. Cryptography mak
 Rust 1.87 is pinned in `mise.toml`.
 
 ```sh
-make setup
-make check
-make run ARGS='prod --help'
-make release
-make install-user
+mise install
+cargo fmt --check
+cargo test
+cargo clippy --all-targets --all-features -- -D warnings
+cargo run -- prod --help
+cargo build --release
+./install
+cargo check --manifest-path fuzz/Cargo.toml
 
 # Optional parser fuzzing (requires cargo-fuzz)
 cargo fuzz run event_log
 ```
 
-`make install-user` installs:
+`./install` installs:
 
 ```text
 ~/.local/bin/git-vault
@@ -299,10 +276,10 @@ src/git.rs                 isolated Git plumbing and CAS refs
 src/event.rs               canonical events and bounded stream parser
 src/state.rs               pure trusted replay, authorization, forks, rollback checks
 src/crypto.rs              epoch wrapping, snapshots, typed value AEAD
-src/identity.rs            backend-neutral hardware identity traits
-src/invitation.rs          SPAKE2 onboarding and admission confirmation
+src/identity.rs            hardware identity and session types
 src/manager.rs             repository-level vault list/create/nuke TUI
 src/backends/yubikey.rs    PC/SC and PIV implementation
+src/backends/touch_id.rs   macOS Touch ID-gated Keychain identity
 src/backends/test_identity.rs software identity for deterministic tests
 src/runtime.rs             command orchestration and immediate event appends
 src/terminal.rs            terminal lifecycle and identity chooser
