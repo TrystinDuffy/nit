@@ -21,7 +21,8 @@ pub struct ForkState {
 #[derive(Clone, Debug, Default)]
 pub struct DeriveOptions {
     pub hardware_checkpoint: Option<VaultTrustRecord>,
-    pub local_checkpoint: Option<Hash>,
+    /// Event hashes previously accepted by this repository. Every one must remain trusted.
+    pub local_checkpoint: Option<Vec<Hash>>,
 }
 
 #[derive(Clone, Debug)]
@@ -34,9 +35,11 @@ pub struct TrustedState {
     pub diagnostics: Vec<String>,
     pub trusted_event_hashes: Vec<Hash>,
     pub membership_event_hash: Hash,
-    trusted_context_hashes: BTreeSet<Hash>,
+    /// Canonically sorted heads of the current epoch's mutation DAG.
+    pub mutation_heads: Vec<Hash>,
     epoch: MembershipEpoch,
-    epoch_deltas: Vec<EventPayload>,
+    epoch_deltas: Vec<(Hash, EventPayload)>,
+    mutation_parents: BTreeMap<Hash, Vec<Hash>>,
     membership_history: BTreeMap<u64, (Hash, Hash)>,
 }
 
@@ -65,34 +68,56 @@ impl TrustedState {
             &self.epoch.snapshot,
             epoch_key,
         )?;
-        for payload in &self.epoch_deltas {
+        let mut last_change = BTreeMap::<String, Hash>::new();
+        let mut conflicts = BTreeSet::new();
+        for (event_hash, payload) in &self.epoch_deltas {
             match payload {
                 EventPayload::Mutation {
                     epoch_number,
                     nonce,
                     ciphertext,
+                    ..
                 } => {
                     ensure!(
                         *epoch_number == self.membership_epoch,
                         "trusted Mutation event has the wrong membership epoch"
                     );
-                    match decrypt_mutation(
+                    let mutation = decrypt_mutation(
                         &self.vault_id,
                         *epoch_number,
                         nonce,
                         ciphertext,
                         epoch_key,
-                    )? {
+                    )?;
+                    let key = match &mutation {
+                        DecryptedMutation::Put { key, .. } | DecryptedMutation::Delete { key } => {
+                            key
+                        }
+                    };
+                    if let Some(previous) = last_change.get(key) {
+                        if !is_ancestor(*previous, *event_hash, &self.mutation_parents) {
+                            conflicts.insert(key.clone());
+                        }
+                    }
+                    match mutation {
                         DecryptedMutation::Put { key, value } => {
+                            last_change.insert(key.clone(), *event_hash);
                             values.insert(key, value);
                         }
                         DecryptedMutation::Delete { key } => {
+                            last_change.insert(key.clone(), *event_hash);
                             values.remove(&key);
                         }
                     }
                 }
                 _ => unreachable!("only value deltas are retained"),
             }
+        }
+        if !conflicts.is_empty() {
+            eprintln!(
+                "WARNING: concurrent changes affected {}; deterministic DAG order selected the displayed values",
+                conflicts.into_iter().collect::<Vec<_>>().join(", ")
+            );
         }
         Ok(values)
     }
@@ -115,7 +140,7 @@ impl TrustedState {
 pub fn derive_trusted_state(events: &[Event], options: &DeriveOptions) -> Result<TrustedState> {
     ensure!(!events.is_empty(), "vault event collection is empty");
     let mut events_by_hash = BTreeMap::new();
-    let mut children = BTreeMap::<Hash, Vec<(Hash, &Event)>>::new();
+    let mut control_children = BTreeMap::<Hash, Vec<(Hash, &Event)>>::new();
     for event in events {
         event.verify_structure()?;
         let hash = event.verified_event_hash()?;
@@ -123,14 +148,17 @@ pub fn derive_trusted_state(events: &[Event], options: &DeriveOptions) -> Result
             events_by_hash.insert(hash, event).is_none(),
             "duplicate event hash in verified event collection"
         );
-        children
-            .entry(event.parent_trust_hash)
-            .or_default()
-            .push((hash, event));
+        if matches!(event.payload, EventPayload::MembershipEpoch(_)) {
+            control_children
+                .entry(event.parent_trust_hash)
+                .or_default()
+                .push((hash, event));
+        }
     }
-    for candidates in children.values_mut() {
+    for candidates in control_children.values_mut() {
         candidates.sort_by_key(|(hash, _)| *hash);
     }
+
     let genesis = events.first().context("vault event collection is empty")?;
     ensure!(
         matches!(genesis.payload, EventPayload::Genesis(_)),
@@ -144,6 +172,10 @@ pub fn derive_trusted_state(events: &[Event], options: &DeriveOptions) -> Result
         unreachable!()
     };
     ensure!(
+        epoch.previous_epoch_heads.is_empty(),
+        "Genesis has preceding mutation heads"
+    );
+    ensure!(
         epoch.epoch_number == 1,
         "Genesis must create membership epoch 1"
     );
@@ -154,6 +186,7 @@ pub fn derive_trusted_state(events: &[Event], options: &DeriveOptions) -> Result
         }),
         "Genesis signer is not an initial owner"
     );
+
     let genesis_hash = genesis.verified_event_hash()?;
     let current_trust_hash = genesis_trust_hash(&genesis_hash);
     let mut trusted_hashes = BTreeSet::from([genesis_hash]);
@@ -167,56 +200,99 @@ pub fn derive_trusted_state(events: &[Event], options: &DeriveOptions) -> Result
         diagnostics: Vec::new(),
         trusted_event_hashes: vec![genesis_hash],
         membership_event_hash: genesis_hash,
-        trusted_context_hashes: BTreeSet::from([current_trust_hash]),
+        mutation_heads: Vec::new(),
         epoch: epoch.clone(),
         epoch_deltas: Vec::new(),
+        mutation_parents: BTreeMap::new(),
         membership_history: membership_history.clone(),
     };
 
     loop {
         let mut candidates = Vec::new();
-        for (event_hash, event) in children
+        for (event_hash, event) in control_children
             .get(&state.current_trust_hash)
             .into_iter()
             .flatten()
         {
-            if trusted_hashes.contains(event_hash) || event.vault_id != state.vault_id {
+            if event.vault_id != state.vault_id {
                 continue;
             }
-            if validate_transition(event, &state).is_ok() {
-                candidates.push((*event_hash, *event));
+            let EventPayload::MembershipEpoch(next_epoch) = &event.payload else {
+                unreachable!()
+            };
+            if validate_membership_transition(event, next_epoch, &state).is_err() {
+                continue;
             }
+            if mutation_closure(&next_epoch.previous_epoch_heads, &events_by_hash, &state).is_err()
+            {
+                continue;
+            }
+            candidates.push((*event_hash, *event));
         }
         if candidates.is_empty() {
             break;
         }
         if candidates.len() > 1 {
-            let mut hashes = candidates.iter().map(|(hash, _)| *hash).collect::<Vec<_>>();
-            hashes.sort();
             state.fork = Some(ForkState {
                 parent_trust_hash: state.current_trust_hash,
-                candidate_event_hashes: hashes,
+                candidate_event_hashes: candidates.iter().map(|(hash, _)| *hash).collect(),
             });
             state
                 .diagnostics
-                .push("trusted replay stopped at competing authorized events".into());
+                .push("membership replay stopped at competing authorized epochs".into());
             break;
         }
+
         let (event_hash, event) = candidates[0];
-        apply_trusted_event(&mut state, event, &event_hash)?;
+        let EventPayload::MembershipEpoch(next_epoch) = &event.payload else {
+            unreachable!()
+        };
+        let closed_mutations =
+            mutation_closure(&next_epoch.previous_epoch_heads, &events_by_hash, &state)?;
+        for hash in closed_mutations {
+            if trusted_hashes.insert(hash) {
+                state.trusted_event_hashes.push(hash);
+            }
+        }
+
         state.current_trust_hash = advance_trust_hash(&state.current_trust_hash, &event_hash);
         trusted_hashes.insert(event_hash);
-        state
-            .trusted_context_hashes
-            .insert(state.current_trust_hash);
         state.trusted_event_hashes.push(event_hash);
-        if matches!(event.payload, EventPayload::MembershipEpoch(_)) {
-            membership_history.insert(
-                state.membership_epoch,
-                (event_hash, state.current_trust_hash),
-            );
-            state.membership_history = membership_history.clone();
+        state.membership_epoch = next_epoch.epoch_number;
+        state.members = next_epoch.members.clone();
+        state.epoch = next_epoch.clone();
+        state.epoch_deltas.clear();
+        state.mutation_parents.clear();
+        state.mutation_heads.clear();
+        state.membership_event_hash = event_hash;
+        membership_history.insert(
+            state.membership_epoch,
+            (event_hash, state.current_trust_hash),
+        );
+        state.membership_history = membership_history.clone();
+    }
+
+    if state.fork.is_none() {
+        let current_mutations = current_epoch_mutations(&events_by_hash, &state)?;
+        let mut parents_used = BTreeSet::new();
+        for hash in &current_mutations {
+            let event = events_by_hash[hash];
+            let EventPayload::Mutation { parents, .. } = &event.payload else {
+                unreachable!()
+            };
+            parents_used.extend(parents.iter().copied());
+            state.mutation_parents.insert(*hash, parents.clone());
+            state.epoch_deltas.push((*hash, event.payload.clone()));
+            if trusted_hashes.insert(*hash) {
+                state.trusted_event_hashes.push(*hash);
+            }
         }
+        state.mutation_heads = current_mutations
+            .iter()
+            .filter(|hash| !parents_used.contains(*hash))
+            .copied()
+            .collect();
+        state.mutation_heads.sort();
     }
 
     classify_inert_events(&mut state, &events_by_hash, &trusted_hashes);
@@ -224,47 +300,169 @@ pub fn derive_trusted_state(events: &[Event], options: &DeriveOptions) -> Result
     Ok(state)
 }
 
-fn validate_transition(event: &Event, state: &TrustedState) -> Result<()> {
+fn validate_membership_transition(
+    event: &Event,
+    epoch: &MembershipEpoch,
+    state: &TrustedState,
+) -> Result<()> {
     let author = state
         .member_for_signing_key(&event.author_signing_key)
-        .context("event author is not a current member")?;
-    match &event.payload {
-        EventPayload::MembershipEpoch(epoch) => {
-            ensure!(
-                author.role == Role::Owner,
-                "membership changes require an owner"
-            );
-            ensure!(
-                epoch.epoch_number == state.membership_epoch + 1,
-                "membership epoch does not increment by one"
-            );
-        }
-        EventPayload::Mutation { epoch_number, .. } => {
-            ensure!(
-                *epoch_number == state.membership_epoch,
-                "value event targets a stale membership epoch"
-            );
-        }
-        EventPayload::Genesis(_) => bail!("event type cannot extend trusted state"),
-    }
+        .context("membership author is not a current member")?;
+    ensure!(
+        author.role == Role::Owner,
+        "membership changes require an owner"
+    );
+    ensure!(
+        epoch.epoch_number == state.membership_epoch + 1,
+        "membership epoch does not increment by one"
+    );
     Ok(())
 }
 
-fn apply_trusted_event(state: &mut TrustedState, event: &Event, event_hash: &Hash) -> Result<()> {
-    match &event.payload {
-        EventPayload::MembershipEpoch(epoch) => {
-            state.membership_epoch = epoch.epoch_number;
-            state.members = epoch.members.clone();
-            state.epoch = epoch.clone();
-            state.epoch_deltas.clear();
-            state.membership_event_hash = *event_hash;
-        }
-        EventPayload::Mutation { .. } => {
-            state.epoch_deltas.push(event.payload.clone());
-        }
-        _ => bail!("cannot apply inert event as trusted"),
-    }
+fn validate_mutation(event: &Event, state: &TrustedState) -> Result<()> {
+    ensure!(
+        event.vault_id == state.vault_id,
+        "mutation is for another vault"
+    );
+    ensure!(
+        event.parent_trust_hash == state.current_trust_hash,
+        "mutation targets another membership context"
+    );
+    ensure!(
+        state
+            .member_for_signing_key(&event.author_signing_key)
+            .is_some(),
+        "mutation author is not a member of its epoch"
+    );
+    let EventPayload::Mutation { epoch_number, .. } = &event.payload else {
+        bail!("event is not a mutation")
+    };
+    ensure!(
+        *epoch_number == state.membership_epoch,
+        "mutation targets another membership epoch"
+    );
     Ok(())
+}
+
+fn mutation_closure(
+    heads: &[Hash],
+    events: &BTreeMap<Hash, &Event>,
+    state: &TrustedState,
+) -> Result<Vec<Hash>> {
+    let mut selected = BTreeSet::new();
+    let mut visiting = BTreeSet::new();
+    for head in heads {
+        visit_mutation(*head, events, state, &mut visiting, &mut selected)?;
+    }
+    topological_mutations(&selected, events)
+}
+
+fn visit_mutation(
+    hash: Hash,
+    events: &BTreeMap<Hash, &Event>,
+    state: &TrustedState,
+    visiting: &mut BTreeSet<Hash>,
+    selected: &mut BTreeSet<Hash>,
+) -> Result<()> {
+    if selected.contains(&hash) {
+        return Ok(());
+    }
+    ensure!(visiting.insert(hash), "mutation DAG contains a cycle");
+    let event = events
+        .get(&hash)
+        .context("committed mutation head or parent is absent")?;
+    validate_mutation(event, state)?;
+    let EventPayload::Mutation { parents, .. } = &event.payload else {
+        unreachable!()
+    };
+    for parent in parents {
+        visit_mutation(*parent, events, state, visiting, selected)?;
+    }
+    visiting.remove(&hash);
+    selected.insert(hash);
+    Ok(())
+}
+
+fn current_epoch_mutations(
+    events: &BTreeMap<Hash, &Event>,
+    state: &TrustedState,
+) -> Result<Vec<Hash>> {
+    let mut valid = BTreeSet::new();
+    loop {
+        let before = valid.len();
+        for (hash, event) in events {
+            if valid.contains(hash) || validate_mutation(event, state).is_err() {
+                continue;
+            }
+            let EventPayload::Mutation { parents, .. } = &event.payload else {
+                continue;
+            };
+            if parents.iter().all(|parent| valid.contains(parent)) {
+                valid.insert(*hash);
+            }
+        }
+        if valid.len() == before {
+            break;
+        }
+    }
+    topological_mutations(&valid, events)
+}
+
+fn topological_mutations(
+    selected: &BTreeSet<Hash>,
+    events: &BTreeMap<Hash, &Event>,
+) -> Result<Vec<Hash>> {
+    let mut indegree = BTreeMap::new();
+    let mut children = BTreeMap::<Hash, Vec<Hash>>::new();
+    for hash in selected {
+        let EventPayload::Mutation { parents, .. } = &events[hash].payload else {
+            bail!("mutation closure contains a non-mutation")
+        };
+        indegree.insert(
+            *hash,
+            parents
+                .iter()
+                .filter(|parent| selected.contains(*parent))
+                .count(),
+        );
+        for parent in parents.iter().filter(|parent| selected.contains(*parent)) {
+            children.entry(*parent).or_default().push(*hash);
+        }
+    }
+    let mut ready = indegree
+        .iter()
+        .filter_map(|(hash, degree)| (*degree == 0).then_some(*hash))
+        .collect::<BTreeSet<_>>();
+    let mut ordered = Vec::with_capacity(selected.len());
+    while let Some(hash) = ready.pop_first() {
+        ordered.push(hash);
+        for child in children.get(&hash).into_iter().flatten() {
+            let degree = indegree.get_mut(child).expect("child was indexed");
+            *degree -= 1;
+            if *degree == 0 {
+                ready.insert(*child);
+            }
+        }
+    }
+    ensure!(
+        ordered.len() == selected.len(),
+        "mutation DAG contains a cycle"
+    );
+    Ok(ordered)
+}
+
+fn is_ancestor(ancestor: Hash, descendant: Hash, parents: &BTreeMap<Hash, Vec<Hash>>) -> bool {
+    let mut pending = vec![descendant];
+    let mut seen = BTreeSet::new();
+    while let Some(hash) = pending.pop() {
+        if hash == ancestor {
+            return true;
+        }
+        if seen.insert(hash) {
+            pending.extend(parents.get(&hash).into_iter().flatten().copied());
+        }
+    }
+    false
 }
 
 fn classify_inert_events(
@@ -273,14 +471,21 @@ fn classify_inert_events(
     trusted_hashes: &BTreeSet<Hash>,
 ) {
     for (hash, event) in events_by_hash {
-        let hash = *hash;
-        if trusted_hashes.contains(&hash) {
+        if trusted_hashes.contains(hash) {
             continue;
         }
         match &event.payload {
             EventPayload::Genesis(_) => state
                 .diagnostics
                 .push("additional Genesis event is inert".into()),
+            EventPayload::Mutation { epoch_number, .. }
+                if *epoch_number < state.membership_epoch =>
+            {
+                state.diagnostics.push(format!(
+                    "stale mutation {} was not committed by its closing membership epoch",
+                    hex::encode_upper(&hash[..8])
+                ))
+            }
             _ => state.diagnostics.push(format!(
                 "event {} is structurally valid but not trusted",
                 hex::encode_upper(&hash[..8])
@@ -310,10 +515,15 @@ fn validate_checkpoints(state: &TrustedState, options: &DeriveOptions) -> Result
             "repository membership fork conflicts with hardware checkpoint"
         );
     }
-    if let Some(local) = options.local_checkpoint {
+    if let Some(local) = &options.local_checkpoint {
+        let trusted = state
+            .trusted_event_hashes
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
         ensure!(
-            local == state.current_trust_hash || state.trusted_context_hashes.contains(&local),
-            "ordinary vault rollback detected by local freshness checkpoint"
+            local.iter().all(|hash| trusted.contains(hash)),
+            "ordinary vault rollback or mutation omission detected by local freshness checkpoint"
         );
     }
     Ok(())
@@ -341,7 +551,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        crypto::{encrypt_snapshot, random_epoch_key, wrap_epoch_key},
+        crypto::{encrypt_mutation, encrypt_snapshot, random_epoch_key, wrap_epoch_key},
         event::{EventPayload, MemberIdentity},
         identity::{DeviceIdentity, IdentityBackend, IdentitySession},
     };
@@ -407,6 +617,7 @@ mod tests {
                 .map(|(identity, role)| member(identity, *role, key, number))
                 .collect(),
             snapshot: encrypt_snapshot(&[1; 32], number, &BTreeMap::new(), key).unwrap(),
+            previous_epoch_heads: Vec::new(),
         }
     }
 
@@ -426,8 +637,13 @@ mod tests {
     }
 
     fn mutation(epoch_number: u64, marker: u8) -> EventPayload {
+        mutation_with_parents(epoch_number, marker, Vec::new())
+    }
+
+    fn mutation_with_parents(epoch_number: u64, marker: u8, parents: Vec<Hash>) -> EventPayload {
         EventPayload::Mutation {
             epoch_number,
+            parents,
             nonce: [marker; 12],
             ciphertext: vec![marker; 16],
         }
@@ -471,14 +687,17 @@ mod tests {
     }
 
     #[test]
-    fn replay_follows_parent_hashes_when_physical_records_are_out_of_order() {
+    fn replay_follows_mutation_dag_when_physical_records_are_out_of_order() {
         let mut alice = identity(13, "Alice");
         let key = random_epoch_key();
         let genesis = genesis(&mut alice, &key);
-        let h1 = trust_after(&genesis);
-        let first = sign_event(&mut alice, h1, mutation(1, 4));
-        let h2 = advance_trust_hash(&h1, &first.event_hash().unwrap());
-        let second = sign_event(&mut alice, h2, mutation(1, 5));
+        let control = trust_after(&genesis);
+        let first = sign_event(&mut alice, control, mutation(1, 4));
+        let second = sign_event(
+            &mut alice,
+            control,
+            mutation_with_parents(1, 5, vec![first.event_hash().unwrap()]),
+        );
         let state = derive_trusted_state(
             &[genesis, second.clone(), first.clone()],
             &DeriveOptions::default(),
@@ -487,20 +706,81 @@ mod tests {
         assert_eq!(state.trusted_event_hashes.len(), 3);
         assert_eq!(state.trusted_event_hashes[1], first.event_hash().unwrap());
         assert_eq!(state.trusted_event_hashes[2], second.event_hash().unwrap());
+        assert_eq!(state.mutation_heads, vec![second.event_hash().unwrap()]);
     }
 
     #[test]
-    fn competing_authorized_children_stop_as_a_fork() {
+    fn concurrent_authorized_mutations_merge_without_a_membership_fork() {
         let mut alice = identity(3, "Alice");
         let key = random_epoch_key();
         let genesis = genesis(&mut alice, &key);
-        let parent = trust_after(&genesis);
-        let first = sign_event(&mut alice, parent, mutation(1, 6));
-        let second = sign_event(&mut alice, parent, mutation(1, 7));
+        let control = trust_after(&genesis);
+        let first = sign_event(&mut alice, control, mutation(1, 6));
+        let second = sign_event(&mut alice, control, mutation(1, 7));
+        let first_hash = first.event_hash().unwrap();
+        let second_hash = second.event_hash().unwrap();
         let state =
             derive_trusted_state(&[genesis, first, second], &DeriveOptions::default()).unwrap();
-        assert!(state.fork.is_some());
-        assert_eq!(state.trusted_event_hashes.len(), 1);
+        assert!(state.fork.is_none());
+        assert_eq!(state.trusted_event_hashes.len(), 3);
+        assert_eq!(state.mutation_heads, {
+            let mut heads = vec![first_hash, second_hash];
+            heads.sort();
+            heads
+        });
+    }
+
+    #[test]
+    fn concurrent_changes_to_one_key_have_a_deterministic_winner() {
+        let mut alice = identity(31, "Alice");
+        let mut bob = identity(32, "Bob");
+        let key = random_epoch_key();
+        let first_epoch = epoch(1, &[(&alice, Role::Owner), (&bob, Role::Member)], &key);
+        let genesis = sign_event(&mut alice, [0; 32], EventPayload::Genesis(first_epoch));
+        let control = trust_after(&genesis);
+
+        let make_put = |value: &str| {
+            let (nonce, ciphertext) = encrypt_mutation(
+                &[1; 32],
+                1,
+                &DecryptedMutation::Put {
+                    key: "TOKEN".into(),
+                    value: VaultValue::Text(value.into()),
+                },
+                &key,
+            )
+            .unwrap();
+            EventPayload::Mutation {
+                epoch_number: 1,
+                parents: Vec::new(),
+                nonce,
+                ciphertext,
+            }
+        };
+        let first = sign_event(&mut alice, control, make_put("alice"));
+        let second = sign_event(&mut bob, control, make_put("bob"));
+        let winner = if first.event_hash().unwrap() > second.event_hash().unwrap() {
+            "alice"
+        } else {
+            "bob"
+        };
+
+        let left = derive_trusted_state(
+            &[genesis.clone(), first.clone(), second.clone()],
+            &DeriveOptions::default(),
+        )
+        .unwrap();
+        let right =
+            derive_trusted_state(&[genesis, second, first], &DeriveOptions::default()).unwrap();
+        assert_eq!(left.mutation_heads, right.mutation_heads);
+        assert_eq!(
+            left.unlock_values(&key).unwrap().get("TOKEN"),
+            Some(&VaultValue::Text(winner.into()))
+        );
+        assert_eq!(
+            left.unlock_values(&key).unwrap(),
+            right.unlock_values(&key).unwrap()
+        );
     }
 
     #[test]
@@ -616,7 +896,7 @@ mod tests {
         assert!(derive_trusted_state(
             &[genesis],
             &DeriveOptions {
-                local_checkpoint: Some([0x55; 32]),
+                local_checkpoint: Some(vec![[0x55; 32]]),
                 ..DeriveOptions::default()
             }
         )

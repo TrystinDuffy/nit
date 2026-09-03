@@ -2,8 +2,16 @@ use clap::Parser;
 use git_vault::{cli::Cli, runtime};
 
 fn main() {
-    if let Err(error) = runtime::run(Cli::parse()) {
-        eprintln!("git-vault: {error:#}");
-        std::process::exit(1);
+    match runtime::run(Cli::parse()) {
+        Ok(outcome) => {
+            let code = outcome.exit_code();
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
+        Err(error) => {
+            eprintln!("git-vault: {error:#}");
+            std::process::exit(1);
+        }
     }
 }

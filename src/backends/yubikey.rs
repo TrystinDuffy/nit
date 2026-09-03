@@ -37,7 +37,6 @@ const INS_GET_METADATA: u8 = 0xF7;
 const INS_GET_SERIAL: u8 = 0xF8;
 const INS_GET_VERSION: u8 = 0xFD;
 const INS_GET_RESPONSE: u8 = 0xC0;
-const INS_MOVE_KEY: u8 = 0xF6;
 
 const TAG_AUTH_WITNESS: u16 = 0x80;
 const TAG_AUTH_CHALLENGE: u16 = 0x81;
@@ -553,37 +552,6 @@ impl YubiKey {
         Ok(())
     }
 
-    fn destroy_and_generate_unprotected_identity(&mut self) -> Result<([u8; 32], [u8; 32])> {
-        ensure!(
-            self.version >= [5, 7, 4],
-            "YubiKey firmware must be 5.7.4 or newer"
-        );
-        self.authenticate_management_key_from_terminal()?;
-
-        // An empty object removes the checkpoint data associated with the old keys.
-        self.write_trust_object(&[])?;
-        for slot in [ENCRYPTION_SLOT, SIGNING_SLOT] {
-            if self.slot_metadata(slot)?.is_some() {
-                self.command(0, INS_MOVE_KEY, 0xFF, slot, &[])
-                    .with_context(|| format!("failed to destroy PIV key in slot {slot:02X}"))?;
-            }
-        }
-
-        let encryption_public_key = self.generate_curve25519(
-            ENCRYPTION_SLOT,
-            ALG_X25519,
-            PIN_POLICY_NEVER,
-            TOUCH_POLICY_NEVER,
-        )?;
-        let signing_public_key = self.generate_curve25519(
-            SIGNING_SLOT,
-            ALG_ED25519,
-            PIN_POLICY_NEVER,
-            TOUCH_POLICY_NEVER,
-        )?;
-        Ok((encryption_public_key, signing_public_key))
-    }
-
     fn generate_curve25519(
         &self,
         slot: u8,
@@ -726,22 +694,6 @@ pub fn provision(identity: &DiscoveredIdentity) -> Result<DeviceIdentity> {
     let mut key = YubiKey::open(Some(serial))?;
     let encryption_public_key = key.ensure_x25519_key(ENCRYPTION_SLOT)?;
     let signing_public_key = key.ensure_ed25519_key(SIGNING_SLOT)?;
-    Ok(DeviceIdentity {
-        backend: IdentityBackend::YubiKey,
-        locator: identity.locator.clone(),
-        display_name: identity.display_name.clone(),
-        encryption_public_key,
-        signing_public_key,
-    })
-}
-
-pub fn destroy_and_reprovision_without_user_auth(
-    identity: &DiscoveredIdentity,
-) -> Result<DeviceIdentity> {
-    let serial = parse_locator(&identity.locator)?;
-    let mut key = YubiKey::open(Some(serial))?;
-    let (encryption_public_key, signing_public_key) =
-        key.destroy_and_generate_unprotected_identity()?;
     Ok(DeviceIdentity {
         backend: IdentityBackend::YubiKey,
         locator: identity.locator.clone(),
