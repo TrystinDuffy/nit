@@ -8,15 +8,16 @@ use crate::identity::IdentitySession;
 
 pub type Hash = [u8; 32];
 pub type VaultId = [u8; 32];
-pub const LOG_MAGIC: &[u8; 8] = b"GVLOG005";
-pub const EVENT_MAGIC: &[u8; 8] = b"GVEVT005";
-pub const FORMAT_VERSION: u16 = 5;
+pub const LOG_MAGIC: &[u8; 8] = b"GVLOG006";
+pub const EVENT_MAGIC: &[u8; 8] = b"GVEVT006";
+pub const FORMAT_VERSION: u16 = 6;
 pub const MAX_EVENT_SIZE: usize = 20 * 1024 * 1024;
 pub const MAX_LOG_SIZE: usize = 64 * 1024 * 1024;
 pub const MAX_MEMBERS: usize = 64;
 pub const MAX_KEY_LEN: usize = 1_024;
 pub const MAX_VALUE_SIZE: usize = 16 * 1024 * 1024;
 pub const MAX_NAME_LEN: usize = 128;
+pub const MAX_MUTATION_PARENTS: usize = 1_024;
 
 const SIGNATURE_DOMAIN: &[u8] = b"git-vault/event-signature/v1";
 const EVENT_HASH_DOMAIN: &[u8] = b"git-vault/event-hash/v1";
@@ -86,6 +87,9 @@ pub struct MembershipEpoch {
     pub epoch_number: u64,
     pub members: Vec<EpochMember>,
     pub snapshot: EncryptedSnapshot,
+    /// Mutation DAG heads from the preceding epoch that the owner included in this snapshot.
+    /// Empty for Genesis.
+    pub previous_epoch_heads: Vec<Hash>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -102,6 +106,9 @@ pub enum EventPayload {
     MembershipEpoch(MembershipEpoch),
     Mutation {
         epoch_number: u64,
+        /// Current mutation DAG heads observed by the writer. Mutations advance this DAG,
+        /// not the linear membership control chain.
+        parents: Vec<Hash>,
         nonce: [u8; 12],
         ciphertext: Vec<u8>,
     },
@@ -405,7 +412,20 @@ fn validate_payload(payload: &EventPayload) -> Result<()> {
         EventPayload::Genesis(epoch) | EventPayload::MembershipEpoch(epoch) => {
             validate_epoch(epoch)?
         }
-        EventPayload::Mutation { ciphertext, .. } => {
+        EventPayload::Mutation {
+            parents,
+            ciphertext,
+            ..
+        } => {
+            ensure!(
+                parents.len() <= MAX_MUTATION_PARENTS,
+                "too many mutation parents"
+            );
+            let mut unique = BTreeSet::new();
+            ensure!(
+                parents.iter().all(|parent| unique.insert(*parent)),
+                "duplicate mutation parent"
+            );
             ensure!(
                 !ciphertext.is_empty() && ciphertext.len() <= MAX_VALUE_SIZE + MAX_KEY_LEN + 64,
                 "invalid encrypted mutation size"
@@ -417,6 +437,18 @@ fn validate_payload(payload: &EventPayload) -> Result<()> {
 
 fn validate_epoch(epoch: &MembershipEpoch) -> Result<()> {
     ensure!(epoch.epoch_number > 0, "membership epoch must be positive");
+    ensure!(
+        epoch.previous_epoch_heads.len() <= MAX_MUTATION_PARENTS,
+        "too many preceding mutation heads"
+    );
+    let mut unique_heads = BTreeSet::new();
+    ensure!(
+        epoch
+            .previous_epoch_heads
+            .iter()
+            .all(|head| unique_heads.insert(*head)),
+        "duplicate preceding mutation head"
+    );
     ensure!(!epoch.members.is_empty(), "membership epoch has no members");
     ensure!(epoch.members.len() <= MAX_MEMBERS, "too many members");
     ensure!(
@@ -473,10 +505,15 @@ fn encode_payload(payload: &EventPayload) -> Result<Vec<u8>> {
         }
         EventPayload::Mutation {
             epoch_number,
+            parents,
             nonce,
             ciphertext,
         } => {
             put_u64(&mut output, *epoch_number);
+            put_u16(&mut output, parents.len() as u16);
+            for parent in parents {
+                output.extend_from_slice(parent);
+            }
             output.extend_from_slice(nonce);
             put_bytes(&mut output, ciphertext)?;
         }
@@ -489,11 +526,22 @@ fn decode_payload(type_code: u16, bytes: &[u8]) -> Result<EventPayload> {
     let payload = match type_code {
         1 => EventPayload::Genesis(decode_epoch(&mut decoder)?),
         2 => EventPayload::MembershipEpoch(decode_epoch(&mut decoder)?),
-        3 => EventPayload::Mutation {
-            epoch_number: decoder.u64()?,
-            nonce: decoder.array()?,
-            ciphertext: decoder.bytes(MAX_VALUE_SIZE + MAX_KEY_LEN + 64, "encrypted mutation")?,
-        },
+        3 => {
+            let epoch_number = decoder.u64()?;
+            let count = decoder.u16()? as usize;
+            ensure!(count <= MAX_MUTATION_PARENTS, "too many mutation parents");
+            let mut parents = Vec::with_capacity(count);
+            for _ in 0..count {
+                parents.push(decoder.array()?);
+            }
+            EventPayload::Mutation {
+                epoch_number,
+                parents,
+                nonce: decoder.array()?,
+                ciphertext: decoder
+                    .bytes(MAX_VALUE_SIZE + MAX_KEY_LEN + 64, "encrypted mutation")?,
+            }
+        }
         _ => bail!("unknown event type {type_code}"),
     };
     decoder.finish()?;
@@ -503,6 +551,10 @@ fn decode_payload(type_code: u16, bytes: &[u8]) -> Result<EventPayload> {
 
 fn encode_epoch(output: &mut Vec<u8>, epoch: &MembershipEpoch) -> Result<()> {
     put_u64(output, epoch.epoch_number);
+    put_u16(output, epoch.previous_epoch_heads.len() as u16);
+    for head in &epoch.previous_epoch_heads {
+        output.extend_from_slice(head);
+    }
     put_u16(output, epoch.members.len() as u16);
     for member in &epoch.members {
         encode_member_identity(output, &member.identity)?;
@@ -518,6 +570,15 @@ fn encode_epoch(output: &mut Vec<u8>, epoch: &MembershipEpoch) -> Result<()> {
 
 fn decode_epoch(decoder: &mut Decoder<'_>) -> Result<MembershipEpoch> {
     let epoch_number = decoder.u64()?;
+    let head_count = decoder.u16()? as usize;
+    ensure!(
+        head_count <= MAX_MUTATION_PARENTS,
+        "too many preceding mutation heads"
+    );
+    let mut previous_epoch_heads = Vec::with_capacity(head_count);
+    for _ in 0..head_count {
+        previous_epoch_heads.push(decoder.array()?);
+    }
     let count = decoder.u16()? as usize;
     ensure!(count <= MAX_MEMBERS, "too many members");
     let mut members = Vec::with_capacity(count);
@@ -540,6 +601,7 @@ fn decode_epoch(decoder: &mut Decoder<'_>) -> Result<MembershipEpoch> {
         epoch_number,
         members,
         snapshot,
+        previous_epoch_heads,
     })
 }
 
@@ -694,6 +756,7 @@ mod tests {
             session.identity.signing_public_key,
             EventPayload::Mutation {
                 epoch_number: 1,
+                parents: Vec::new(),
                 nonce: [3; 12],
                 ciphertext: vec![marker; 16],
             },

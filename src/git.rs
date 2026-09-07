@@ -10,6 +10,7 @@ use anyhow::{ensure, Context, Result};
 use crate::event::{EventLog, Hash, MAX_LOG_SIZE};
 
 const LOG_PATH: &str = "vault.log";
+const LOCAL_CHECKPOINT_MAGIC: &[u8; 8] = b"GVLCP001";
 
 #[derive(Clone, Debug)]
 pub struct StoredLog {
@@ -64,6 +65,7 @@ impl GitRepository {
         validate_vault_name(vault)?;
         let primary = vault_ref(vault);
         let local = local_ref(vault);
+        let recovery_ack = recovery_ack_ref(vault);
         let mut references = self
             .list_refs("refs/vaults/")?
             .into_iter()
@@ -74,6 +76,11 @@ impl GitRepository {
                     .filter(|reference| reference == &local),
             )
             .collect::<Vec<_>>();
+        references.extend(
+            self.list_refs("refs/vault-recovery-ack/")?
+                .into_iter()
+                .filter(|reference| reference == &recovery_ack),
+        );
         references.extend(
             self.list_refs("refs/vault-remotes/")?
                 .into_iter()
@@ -197,27 +204,79 @@ impl GitRepository {
         Ok(commit)
     }
 
-    pub fn read_local_checkpoint(&self, vault: &str) -> Result<Option<Hash>> {
+    pub fn read_local_checkpoint(&self, vault: &str) -> Result<Option<Vec<Hash>>> {
         validate_vault_name(vault)?;
         let reference = local_ref(vault);
         let Some(oid) = self.resolve_ref(&reference, "blob")? else {
             return Ok(None);
         };
         let bytes = self.git_bytes(["cat-file", "blob", &oid])?;
-        ensure!(bytes.len() == 32, "local freshness checkpoint is malformed");
-        Ok(Some(bytes.try_into().expect("length checked")))
+        ensure!(
+            bytes.len() >= 12 && &bytes[..8] == LOCAL_CHECKPOINT_MAGIC,
+            "local freshness checkpoint is malformed"
+        );
+        let count = u32::from_be_bytes(bytes[8..12].try_into().expect("length checked")) as usize;
+        ensure!(
+            count <= MAX_LOG_SIZE / 32 && bytes.len() == 12 + count * 32,
+            "local freshness checkpoint is malformed"
+        );
+        let mut hashes = Vec::with_capacity(count);
+        for chunk in bytes[12..].chunks_exact(32) {
+            hashes.push(chunk.try_into().expect("length checked"));
+        }
+        ensure!(
+            hashes.windows(2).all(|pair| pair[0] < pair[1]),
+            "local freshness checkpoint is not canonical"
+        );
+        Ok(Some(hashes))
     }
 
-    pub fn write_local_checkpoint(&self, vault: &str, hash: &Hash) -> Result<()> {
+    pub fn write_local_checkpoint(&self, vault: &str, hashes: &[Hash]) -> Result<()> {
         validate_vault_name(vault)?;
+        let mut hashes = hashes.to_vec();
+        hashes.sort();
+        hashes.dedup();
+        ensure!(
+            hashes.len() <= MAX_LOG_SIZE / 32,
+            "local freshness checkpoint is too large"
+        );
+        let mut encoded = Vec::with_capacity(12 + hashes.len() * 32);
+        encoded.extend_from_slice(LOCAL_CHECKPOINT_MAGIC);
+        encoded.extend_from_slice(&(hashes.len() as u32).to_be_bytes());
+        for hash in hashes {
+            encoded.extend_from_slice(&hash);
+        }
         let reference = local_ref(vault);
         let old = self.resolve_ref(&reference, "blob")?;
-        let blob = self.hash_object(hash)?;
+        let blob = self.hash_object(&encoded)?;
         let old = old.unwrap_or_else(|| "0".repeat(blob.len()));
         let output = self.git_output(["update-ref", &reference, &blob, &old], None)?;
         ensure!(
             output.status.success(),
             "local freshness checkpoint changed concurrently"
+        );
+        Ok(())
+    }
+
+    pub fn has_unrecoverable_ack(&self, vault: &str, vault_id: &Hash) -> Result<bool> {
+        validate_vault_name(vault)?;
+        let reference = recovery_ack_ref(vault);
+        let Some(oid) = self.resolve_ref(&reference, "blob")? else {
+            return Ok(false);
+        };
+        Ok(self.git_bytes(["cat-file", "blob", &oid])? == vault_id)
+    }
+
+    pub fn write_unrecoverable_ack(&self, vault: &str, vault_id: &Hash) -> Result<()> {
+        validate_vault_name(vault)?;
+        let reference = recovery_ack_ref(vault);
+        let old = self.resolve_ref(&reference, "blob")?;
+        let blob = self.hash_object(vault_id)?;
+        let old = old.unwrap_or_else(|| "0".repeat(blob.len()));
+        let output = self.git_output(["update-ref", &reference, &blob, &old], None)?;
+        ensure!(
+            output.status.success(),
+            "unrecoverable acknowledgement changed concurrently"
         );
         Ok(())
     }
@@ -412,6 +471,10 @@ fn local_ref(vault: &str) -> String {
     format!("refs/vault-local/{vault}")
 }
 
+fn recovery_ack_ref(vault: &str) -> String {
+    format!("refs/vault-recovery-ack/{vault}")
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -441,11 +504,18 @@ mod tests {
             .append_vault_log("prod", None, &log, "stale create")
             .is_err());
 
-        repository.write_local_checkpoint("prod", &[7; 32]).unwrap();
+        repository
+            .write_local_checkpoint("prod", &[[7; 32]])
+            .unwrap();
         assert_eq!(
             repository.read_local_checkpoint("prod").unwrap(),
-            Some([7; 32])
+            Some(vec![[7; 32]])
         );
+        assert!(!repository.has_unrecoverable_ack("prod", &[8; 32]).unwrap());
+        repository
+            .write_unrecoverable_ack("prod", &[8; 32])
+            .unwrap();
+        assert!(repository.has_unrecoverable_ack("prod", &[8; 32]).unwrap());
 
         let archive = repository
             .append_vault_log("archive", None, &log, "create another vault")
@@ -479,7 +549,7 @@ mod tests {
             repository.list_vaults().unwrap(),
             vec!["archive".to_owned(), "prod".to_owned()]
         );
-        assert_eq!(repository.delete_vault("prod").unwrap(), 3);
+        assert_eq!(repository.delete_vault("prod").unwrap(), 4);
         assert!(repository.read_vault("prod").unwrap().is_none());
         assert!(repository.read_local_checkpoint("prod").unwrap().is_none());
         assert_eq!(repository.list_vaults().unwrap(), vec!["archive"]);

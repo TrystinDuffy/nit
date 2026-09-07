@@ -22,7 +22,7 @@ The interactive vault TUI derives a verified trusted projection, unlocks the cur
 
 Successful secret edits immediately append immutable, signed events.
 
-> **Early security prototype:** deterministic trusted replay, encrypted mutations, Git event-set merging, persistent YubiKey membership checkpoints, Ed25519/X25519 hardware identities, and physical-presence onboarding are implemented and tested. The YubiKey checkpoint object still needs broader power-loss/endurance testing. Do not use this as the only copy of important secrets.
+> **Early security prototype:** deterministic trusted replay, concurrent encrypted mutation merging, Git event-set union, persistent YubiKey membership checkpoints, Ed25519/X25519 hardware identities, physical-presence onboarding, and safe identity rotation are implemented and tested. The YubiKey checkpoint object still needs broader power-loss/endurance testing. Do not use this as the only copy of important secrets.
 
 ## Storage model
 
@@ -40,14 +40,17 @@ Additional refs are isolated by purpose:
 
 ```text
 refs/vault-remotes/<remote>/<vault>   fetched, untrusted remote state
-refs/vault-local/<vault>              local freshness checkpoint object
+refs/vault-local/<vault>              local accepted-event checkpoint object
+refs/vault-recovery-ack/<vault>       local unrecoverable-use acknowledgement
 ```
 
 Git stores, synchronizes, and retains history. Git commits, authors, timestamps, and ancestry do not decide event authorization.
 
-Nuking through the manager removes the selected vault's local `refs/vaults/*`, freshness, and staged remote refs. It does not delete a remote repository's vault ref, and unreachable Git objects may remain recoverable until Git garbage collection. This is ref deletion, not guaranteed forensic erasure.
+Nuking through the manager removes the selected vault's local `refs/vaults/*`, freshness, recovery acknowledgement, and staged remote refs. It does not delete a remote repository's vault ref, and unreachable Git objects may remain recoverable until Git garbage collection. This is ref deletion, not guaranteed forensic erasure.
 
 ## Trust model
+
+The frozen v1 security boundary, attacker assumptions, explicit non-goals, and balanced/high-security/unattended hardware profiles are defined in [`docs/threat-model.md`](docs/threat-model.md). In particular, compromised unlocked endpoints and malicious authorized members are outside the confidentiality guarantee.
 
 Anyone who can write Git objects may append candidate events. Every client independently computes the trusted projection:
 
@@ -55,9 +58,9 @@ Anyone who can write Git objects may append candidate events. Every client indep
 untrusted event set
     -> bounded canonical parsing
     -> Ed25519 signature verification
-    -> parent_trust_hash matching
-    -> authorization under the previously trusted membership
-    -> derived trusted state
+    -> linear owner-authorized membership replay
+    -> per-epoch member-authorized mutation DAG replay
+    -> deterministic trusted projection
 ```
 
 The code distinguishes:
@@ -67,13 +70,15 @@ The code distinguishes:
 
 Structurally valid but unauthorized events remain inert. A removed member can continue appending mathematically valid signatures, but those events cannot extend the trusted state.
 
-Every trusted child binds the logical state it intends to extend:
+Membership is a linear owner-authorized control chain:
 
 ```text
-Hnext = SHA256("git-vault/trust/v1" || Hcurrent || event_hash)
+Hnext = SHA256("git-vault/trust/v1" || Hcurrent || membership_event_hash)
 ```
 
-If multiple authorized children target the same trusted hash, replay stops and reports a fork. V1 does not silently select or merge one branch.
+Competing authorized `MembershipEpoch` children remain a fail-closed fork. Mutations do not advance this control hash. They target one membership context and form a causal DAG by naming the mutation heads observed by their writer. Concurrent mutations are unioned and replayed in deterministic topological order with event-hash tie-breaking. Concurrent changes to the same secret are reported, and the deterministic later event supplies the displayed value.
+
+A membership transition commits the preceding epoch's included mutation heads and snapshots that projection. Valid old-epoch mutations omitted by that closing epoch remain stale and inert; they cannot reappear after a member is removed.
 
 ## Membership epochs
 
@@ -107,13 +112,13 @@ PIV slot 83   Ed25519 event signing
 
 Private keys remain on the device. Normal provisioning uses PIN-once with touch-always for X25519 and touch-cached for Ed25519. Identity sessions keep the replay and crypto code independent of the local key mechanism.
 
-PIN and touch policies are immutable after PIV key generation. An explicit destructive replacement can generate both keys with `PIN never` and `touch never`:
+PIN and touch policies are immutable after PIV key generation. Unsafe destructive in-place replacement is disabled. Rotate an identity by connecting the current owner and its replacement:
 
 ```sh
-git vault <vault> destroy-identity --identity <serial>
+git vault <vault> --identity <old> rotate-identity --new-identity <new> --name "Replacement owner"
 ```
 
-The command requires typing `DESTROY <serial>` and authenticating with the PIV management key. It destroys the old permanent identity and clears its hardware checkpoints; existing vault refs are deliberately left untouched. Any vault that trusted only the destroyed identity becomes inaccessible and must be recovered by another member or nuked and recreated. With neither PIN nor touch, any local process can use the connected YubiKey to decrypt and sign.
+Rotation first commissions the replacement as an owner, proves fresh signing and X25519 possession, unwraps the proposed epoch key, decrypts the proposed snapshot as a recovery drill, checkpoints both identities, then removes the old identity in a second membership epoch. A failure between epochs leaves both identities trusted rather than destroying the only key. The old PIV slots are never erased by this workflow.
 
 On macOS, `--identity touchid` creates or opens one Ed25519/X25519 identity stored in the login Keychain. The CLI requests Touch ID through LocalAuthentication before loading the private keys, but unlike a YubiKey or a future Secure Enclave implementation, those keys enter application memory while the vault is open.
 
@@ -149,10 +154,13 @@ git vault prod set ENABLED --type boolean
 git vault prod set KEY_BYTES --type bytes
 git vault prod delete TOKEN
 git vault prod members
+git vault prod exec --env TOKEN -- program args...
+git vault prod acknowledge-unrecoverable
 git vault prod add-member --name Bob --new-identity <serial|touchid> --capability member
 git vault prod add-member --name Bob --new-identity <serial|touchid> --capability owner
 git vault prod remove-member <name-or-fingerprint>
 git vault prod set-role <name-or-fingerprint> member
+git vault prod --identity <old> rotate-identity --new-identity <new> --name "New owner"
 git vault prod verify
 ```
 
@@ -166,6 +174,40 @@ bytes       hexadecimal command input/output
 ```
 
 Secret prompts use the controlling terminal. `--stdin` is an explicit pipeline opt-in.
+
+Before the first mutation, a vault must have at least two tested owners. Commissioning an owner performs the signing, unwrap, and snapshot recovery drill. A user who deliberately accepts permanent loss from sole-identity failure may instead run `acknowledge-unrecoverable`; this acknowledgement is local to the repository and must be repeated in another clone.
+
+## Running commands with secrets
+
+`exec` opens the vault through the normal trusted replay, rollback checks, identity selection, and hardware authentication path, then directly starts one child process with only the explicitly selected values added to its inherited environment:
+
+```sh
+git vault staging exec \
+  --env TURSO_DATABASE_URL \
+  --env TURSO_AUTH_TOKEN \
+  -- npm run db:migrate
+```
+
+Use `ENV_NAME=VAULT_KEY` to rename variables for the child:
+
+```sh
+git vault staging exec \
+  --env DATABASE_URL=TURSO_DATABASE_URL \
+  --env DATABASE_AUTH_TOKEN=TURSO_AUTH_TOKEN \
+  -- npm run db:migrate
+```
+
+Nit does not print the injected values, write an environment file, invoke a shell, or interpolate secrets into command arguments. The child receives the supplied argument vector directly and inherits stdin, stdout, stderr, the current directory, and ordinary parent environment; an explicit mapping overrides an inherited variable of the same name. Human-presence requirements from the selected YubiKey or Touch ID identity still apply when opening the vault.
+
+> A caller authorized to execute an arbitrary child process with a secret in its environment should be considered capable of reading that secret.
+
+The child, anyone controlling its command, and sufficiently privileged operating-system observers can copy, print, retain, or pass the environment to descendants. `exec` reduces accidental exposure through command substitution, stdout, shell history, temporary env files, and agent transcripts; it is not isolation or sandboxing. Nit zeroizes its owned plaintext where practical, but cannot guarantee zeroization of copies made by the operating system or receiving process. Secret injection into argv is deliberately unsupported because command arguments may be exposed through process inspection and other OS interfaces.
+
+A normally exiting child supplies nit's exit code unchanged. On Unix, signal termination maps to the conventional wrapper status `128 + signal`; spawn and vault failures remain nit errors rather than child statuses.
+
+## Future execution experiments
+
+Possible follow-on work, not implemented by `exec` v1: `--clean-env`; agent-specific identities; authorization finer than vault-wide `member`; command/action policies; human approval for privileged use; short-lived vendor credentials; bounded control-plane credentials that avoid vendor master credentials; and optional local execution audit metadata without secret values.
 
 ## Synchronization
 
@@ -184,13 +226,13 @@ refs/vault-remotes/origin/prod
 
 The fetched event set is parsed and unioned with the local set by event hash. The merged set is replayed, forks and rollback are checked, and a two-parent Git commit preserves both local and remote histories. A remote omission cannot delete a local event.
 
-Never configure `refs/vault-local/*` for pushing. It contains the local freshness checkpoint.
+Never configure `refs/vault-local/*` or `refs/vault-recovery-ack/*` for pushing. They contain machine-local safety state.
 
 ## Physical-presence membership management
 
 Adding a member is synchronous: an existing owner key and the new key must both be connected to the same machine. The new key is provisioned if needed, proves possession of its Ed25519 signing key, and unwraps the next X25519-wrapped epoch key before admission. The owner then signs one `MembershipEpoch` event containing the exact new identity, name, capability, encrypted snapshot, and wrapped epoch keys.
 
-The membership event is committed only after both local key proofs succeed. The owner and new key checkpoints are then written and reread. If the Git commit succeeds but either checkpoint update fails, the member is already admitted; reconnect the affected key and reopen the vault. Opening verifies the committed lineage and retries any missing or older checkpoint rather than creating another membership event.
+The membership event is committed only after both local key proofs and snapshot recovery succeed. It commits the preceding mutation DAG heads. The owner and new key checkpoints are then written and reread. If the Git commit succeeds but either checkpoint update fails, the member is already admitted; reconnect the affected key and reopen the vault. Opening verifies the committed lineage and retries any missing or older checkpoint rather than creating another membership event.
 
 Trusted replay authorizes the change from the existing owner's signature. Physical presence is an enforced local interaction, not an asynchronous event transcript.
 
@@ -198,7 +240,7 @@ Trusted replay authorizes the change from the existing owner's signature. Physic
 
 Two independent mechanisms are designed:
 
-- `refs/vault-local/<vault>` detects ordinary trusted-state rollback on a machine that has previously accepted a newer state.
+- `refs/vault-local/<vault>` stores the canonical set of previously accepted event hashes and detects both control-state rollback and omission of accepted mutations.
 - A management-key-authenticated YubiKey trust object anchors the newest accepted membership epoch outside rollbackable Git. Touch ID identities instead use the weaker local Keychain checkpoint described above.
 
 The YubiKey stores up to 16 canonically ordered vault-name/checkpoint records in PIV object `5FC10E`; it never silently evicts one. Creating a vault or accepting a newer membership epoch requires persisting and rereading this checkpoint. Failure aborts acceptance with a prominent error. This binds a familiar vault name to its permanent vault ID, membership event, and trust hash, so a replacement repository cannot silently establish another Genesis for that name.
@@ -207,15 +249,15 @@ The management key is requested through the controlling terminal for checkpoint 
 
 ## Binary format and limits
 
-The current prototype format uses `GVLOG005`/`GVEVT005`. The explicit binary codec is versioned, length-delimited, canonical, and independently frames each event. Prototype formats are not migrated or accepted as legacy input.
+The current prototype format uses `GVLOG006`/`GVEVT006`. The explicit binary codec is versioned, length-delimited, canonical, and independently frames each event. Prototype formats are not migrated or accepted as legacy input.
 
 ```text
 log magic
 event length
 event magic + version
 vault ID + event type
-parent trust hash + author signing key
-bounded canonical payload
+membership-context hash + author signing key
+bounded canonical payload (including mutation DAG parents or preceding-epoch heads)
 Ed25519 signature
 ```
 
@@ -274,7 +316,7 @@ Linux builds require PC/SC development libraries, and runtime YubiKey access req
 src/cli.rs                 stable Git-subcommand CLI
 src/git.rs                 isolated Git plumbing and CAS refs
 src/event.rs               canonical events and bounded stream parser
-src/state.rs               pure trusted replay, authorization, forks, rollback checks
+src/state.rs               membership-chain and mutation-DAG replay, authorization, conflicts, rollback checks
 src/crypto.rs              epoch wrapping, snapshots, typed value AEAD
 src/identity.rs            hardware identity and session types
 src/manager.rs             repository-level vault list/create/nuke TUI
